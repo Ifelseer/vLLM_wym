@@ -1,0 +1,57 @@
+# ============================================================
+# vLLM_wym 配置（命令行覆盖此处默认值）
+# 命令行参数会覆盖此处的默认值
+#
+# 默认是「体验档」：eager 前向，启动快、稳定，适合首次跑通。
+# 追求吞吐时，把下面「性能档」两处开关打开（或加 --cg --compile）。
+# ============================================================
+
+# --- 模型 ---
+model: "Qwen3-0.6B"
+
+# --- 推理参数 ---
+prompt: "Hello, my name is"
+max_new_tokens: 200
+temperature: 0.9
+top_p: 0.95
+top_k: 20
+
+# --- 引擎 ---
+enforce_eager: true   # true=eager（体验档默认）；false=启用 Decode CUDA Graph（性能档）
+torch_compile: false  # true=prefill 首 chunk 走 torch.compile（性能档）；false=不编译
+compile_mode: "reduce-overhead"  # default / reduce-overhead / max-autotune
+compile_dynamic: true   # true=符号形状（一次编译覆盖任意长度，在线服务推荐）；false=固定形状重放（新长度会重编译）
+dtype: "auto"           # 显式填 float16 / bfloat16 可覆盖；auto 通常落到 float16
+context_len: 4096
+
+# --- 调度器 ---
+max_num_seqs: 256
+max_num_batched_tokens: 8192
+mix_prefill_decode: true
+
+# --- KV Cache ---
+kvcache_block_size: 256  # FA2 paged 要求 256 的倍数
+prefix_backend: "hash"   # none / hash / radix
+gpu_memory_utilization: 0.85  # 开 CG+compile 时可调低至 0.8，避免小显存 OOM
+num_kvcache_blocks: 0    # 0=自动计算
+
+# --- 并行（多机多卡）---
+tp_size: 1   # 张量并行度：机内 NVLink，切 head / 切权重
+pp_size: 1   # 流水线并行度：跨机低带宽，切层
+dp_size: 1   # 数据并行副本数：多卡吞吐优先起独立引擎副本（每副本 tp*pp 张卡）
+pp_layer_counts: null  # 不均分 PP 每 stage 层数（如 [12,28] 适配异卡显存）；null=等分
+device_ids: null  # 每进程可见 GPU 列表（如 [1,0]）；null=按 local_rank 自动映射
+nccl_port: 29500   # 单机 spawn 时的 NCCL rendezvous 端口
+master_addr: "127.0.0.1"  # 多机 rendezvous 主节点地址
+master_port: 29500        # 多机 rendezvous 端口
+nccl_ifname: ""  # 多机网卡名（如 ib0/eth0）；空=自动探测
+
+# --- MoE ---
+enable_ep: false          # true=在现有 TP ranks 上按 expert 切分（不扩大 world）
+moe_backend: "auto"       # auto / cutlass / triton；MoE 可开 --cg（workspace 池化）
+
+# --- 分布式 CG / compile（torchrun 多机路径同样生效）---
+# enforce_eager: false → decode piecewise CUDA Graph（PP 时 recv/send 图外）；
+# torch_compile: true → prefill torch.compile（含 TP 时用 max-autotune-no-cudagraphs）。
+# 覆盖方式：命令行加 --cg / --compile。
+# 并行语义：dp=独立 Engine 副本；tp/pp=同 Engine NCCL（见 docs/parallelism.md）。

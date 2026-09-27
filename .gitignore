@@ -1,0 +1,45 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# --- 虚拟环境 / 工具缓存 ---
+.venv/
+venv/
+.python-version
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- 模型权重 / 缓存（不入库）---
+huggingface/
+*.safetensors
+*.bin
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# --- profiler / bench 产物 ---
+**/traces/
+*.pt.trace.json
+*.nsys-rep
+chrome_trace*.json
+bench/results/
+bench/out/
+*.log
+tmp/
+.cache/
+wandb/
+outputs/
+checkpoints/
