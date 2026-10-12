@@ -24,6 +24,7 @@ class KVPool:
         block_size: int,
         device: torch.device,
         dtype: torch.dtype,
+        kv_dtype: torch.dtype | None = None,
     ) -> None:
         if num_blocks <= 0:
             raise ValueError(f"num_blocks must be > 0, got {num_blocks}")
@@ -32,8 +33,11 @@ class KVPool:
         self.block_size = block_size
         self.device = device
         self.dtype = dtype
+        # KV cache 的数据精度：None = 跟随激活 dtype；fp8 时 KV 显存减半
+        # （块数按 kv_dtype.itemsize 计算，见 auto_num_blocks）
+        self.kv_dtype = kv_dtype or dtype
         self.kv_cache = self._alloc_pool(
-            hf_config, num_blocks, block_size, device, dtype
+            hf_config, num_blocks, block_size, device, self.kv_dtype
         )
 
     @staticmethod
@@ -51,7 +55,7 @@ class KVPool:
         )
         print(
             f"KV pool: {num_blocks} blocks × {block_size} tok "
-            f"({num_blocks * block_bytes / (1024**3):.2f} GiB)"
+            f"({num_blocks * block_bytes / (1024**3):.2f} GiB, dtype={dtype})"
         )
         return kv
 

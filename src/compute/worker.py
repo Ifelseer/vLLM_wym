@@ -108,9 +108,41 @@ class Worker:
         self.sampler = Sampler()
         self._mem_baseline = torch.cuda.memory_reserved()
         self.kv = self._make_kv()
+        qo_heads, kv_heads, head_dim = self._attn_dims()
         self.model_runner = ModelRunner(
-            model, self.kv, self.sampler, config=self.config, device=self.device
+            model,
+            self.kv,
+            self.sampler,
+            config=self.config,
+            device=self.device,
+            num_qo_heads=qo_heads,
+            num_kv_heads=kv_heads,
+            head_dim=head_dim,
         )
+
+    def _attn_dims(self) -> tuple[int, int, int]:
+        """TP 本地的 (qo_heads, kv_heads, head_dim)（FP8 KV 的 FlashInfer 需要）。"""
+        text = getattr(self.config.hf_config, "text_config", self.config.hf_config)
+        heads = int(text.num_attention_heads) // self.tp_size
+        n_kv = max(1, int(text.num_key_value_heads) // self.tp_size)
+        hd = getattr(text, "head_dim", None)
+        if hd is None:
+            hd = int(text.hidden_size) // int(text.num_attention_heads)
+        return heads, n_kv, int(hd)
+
+    def _kv_dtype(self) -> torch.dtype | None:
+        """FP8 KV cache 的 dtype；不支持时回退 None（BF16 KV）并告警。"""
+        qc = self.config.quant_config
+        if qc is None or qc.kv_cache_dtype is None:
+            return None
+        major, minor = torch.cuda.get_device_capability(self.device)
+        if (major, minor) < (8, 9):
+            print(
+                f"[WARN] FP8 KV cache requires SM89+ (got SM{major}{minor}); "
+                "falling back to BF16 KV cache"
+            )
+            return None
+        return qc.kv_cache_dtype
 
     def _resolve_dtype(self) -> torch.dtype:
         if self.config.dtype != "auto":
@@ -188,6 +220,7 @@ class Worker:
 
     def _make_kv(self) -> KVPool:
         use_cg = not self.config.enforce_eager
+        kv_dtype = self._kv_dtype()
         if self.config.num_kvcache_blocks > 0:
             num_blocks = self.config.num_kvcache_blocks
         else:
@@ -195,7 +228,8 @@ class Worker:
             num_blocks = KVPool.auto_num_blocks(
                 self.config.hf_config,
                 block_size=self.config.block_size,
-                dtype=self.dtype,
+                # KV 块大小按 kv_dtype 计算（fp8 时块数翻倍）
+                dtype=kv_dtype or self.dtype,
                 device=self.device,
                 gpu_memory_utilization=self.config.gpu_memory_utilization,
                 reserve_bytes=reserve,
@@ -212,6 +246,7 @@ class Worker:
             block_size=self.config.block_size,
             device=self.device,
             dtype=self.dtype,
+            kv_dtype=kv_dtype,
         )
 
     def get_kv_cache_size(self) -> int:

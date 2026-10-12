@@ -16,10 +16,20 @@ class CUDAGraphRunner:
         self.outputs: dict[int, Any] = {}
         self._graph_pool = None
 
-    def capture(self, body: Callable[[int], Any]) -> None:
+    def capture(self, body: Callable[[int], Any], *, on_warmup: Callable[[int], None] | None = None) -> None:
+        """按 bs 列表捕获 decode 子图。
+
+        Args:
+            body: 捕获/ warmup 的前向体。
+            on_warmup: 可选，每个 bs 录图前的钩子（在 warmup 前向之前调用）。
+                用于不能进图的预备工作（如 FP8 KV 的 FlashInfer plan——
+                内部有 D2H 拷贝）。warmup 前向本身也会触发一次完整计算。
+        """
         torch.cuda.synchronize(self.device)
         torch.cuda.empty_cache()
         for bs in sorted(self.bs_list, reverse=True):
+            if on_warmup is not None:
+                on_warmup(bs)
             body(bs)  # warmup：初始化算子与 NCCL 集合通信顺序
             graph = torch.cuda.CUDAGraph()
             with graph_capture(self.device):

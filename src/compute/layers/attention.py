@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover - 开发机（Windows/CPU）无 flash_attn
     _HAS_FLASH_ATTN = False
 
-from ..kv_ops import store_kvcache
+from ..kv_ops import store_kvcache, store_kvcache_fp8
 
 
 def _require_flash_attn() -> None:
@@ -38,6 +38,10 @@ class AttnInputs(NamedTuple):
 @dataclass
 class AttnMetadata:
     kv_cache: torch.Tensor
+    # FP8 KV cache（None = BF16 KV，走 FA2 原路径）
+    fp8_kv: object = None
+    # decode CUDA Graph replay 中：True 时用 CG wrapper（plan 已在录图外完成）
+    fp8_kv_cg: bool = False
 
 
 _ATTN_META: Optional[AttnMetadata] = None
@@ -74,10 +78,16 @@ def attention(
 ) -> torch.Tensor:
     meta = _ATTN_META
     assert meta is not None, "attention_context() not active"
-    _require_flash_attn()
     pool = meta.kv_cache
     k_cache = pool[0, layer_id]
     v_cache = pool[1, layer_id]
+    if meta.fp8_kv is not None:
+        return _attention_fp8(
+            meta, k, v, k_cache, v_cache, slot_mapping, is_prefill,
+            cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+            block_tables, layer_id, num_qo_heads, num_kv_heads, head_dim,
+        )
+    _require_flash_attn()
     store_kvcache(
         k,
         v,
@@ -124,6 +134,76 @@ def _attention_fake(
     return torch.empty(
         (q.shape[0], num_qo_heads * head_dim), dtype=q.dtype, device=q.device
     )
+
+
+def _attention_fp8(
+    meta: AttnMetadata,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    is_prefill: bool,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    block_tables: Optional[torch.Tensor],
+    layer_id: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """FP8 KV cache 通路：量化写入 + FlashInfer paged attention。
+
+    - 首次写入该层时按 amax 校准固定 scale（之后冻结，保证增量 KV 一致）；
+    - prefill 无前缀缓存的首 chunk 仍走 FA2 varlen（直接读当前批 bf16 k/v，
+      不碰 cache）；有缓存时走 FlashInfer paged prefill（kv fp8 + scale）；
+    - decode 走 FlashInfer paged decode（plan 已在 ModelRunner 录图外完成）。
+    """
+    mgr = meta.fp8_kv
+    k_scale, v_scale = mgr.scales(layer_id)
+    mgr.maybe_calibrate(layer_id, k, v)
+    k_scale, v_scale = mgr.scales(layer_id)  # 校准后重新取（值可能已更新）
+
+    nkv_hd = (num_kv_heads, head_dim)
+    store_kvcache_fp8(
+        k,
+        v,
+        k_cache.reshape(-1, *nkv_hd),
+        v_cache.reshape(-1, *nkv_hd),
+        slot_mapping,
+        k_scale,
+        v_scale,
+    )
+    q = q.contiguous().view(-1, num_qo_heads, head_dim)
+    if is_prefill:
+        if block_tables is not None:
+            # 有前缀缓存：全部 KV（缓存 + 本 chunk）从 fp8 cache 读
+            o = mgr.run_prefill(q, layer_id)
+        else:
+            # 首 chunk：直接读当前批 bf16 k/v（FA2，无需 scale）
+            _require_flash_attn()
+            kk = k.contiguous().view(-1, *nkv_hd)
+            vv = v.contiguous().view(-1, *nkv_hd)
+            from flash_attn import flash_attn_varlen_func
+
+            o = flash_attn_varlen_func(
+                q,
+                kk,
+                vv,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                causal=True,
+            )
+    else:
+        if meta.fp8_kv_cg:
+            o = mgr.run_decode_cg(q, layer_id)
+        else:
+            o = mgr.run_decode(q, layer_id)
+    return o.view(-1, num_qo_heads * head_dim)
 
 
 class Attention(nn.Module):

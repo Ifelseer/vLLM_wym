@@ -28,6 +28,9 @@ class ModelRunner:
         *,
         config: EngineConfig,
         device: torch.device,
+        num_qo_heads: int = 0,
+        num_kv_heads: int = 0,
+        head_dim: int = 0,
     ) -> None:
         self.model = model
         self.kv = kv
@@ -59,6 +62,27 @@ class ModelRunner:
             block_size=self.block_size,
         )
 
+        # FP8 KV cache（kv.kv_dtype == fp8 时启用；scale 校准与 FlashInfer
+        # wrapper 见 compute/fp8_kv.py）
+        self._fp8_kv = None
+        if kv.kv_dtype == torch.float8_e4m3fn:
+            from .fp8_kv import Fp8KVManager
+
+            self._fp8_kv = Fp8KVManager(
+                num_layers=self.kv_cache.shape[1],
+                num_qo_heads=num_qo_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                page_size=self.block_size,
+                max_batch_size=max_bs,
+                max_blocks_per_seq=max_blocks,
+                device=device,
+                use_cuda_graph=not config.enforce_eager,
+            )
+            self._fp8_kv.set_kv_cache(self.kv_cache)
+            self._meta.fp8_kv = self._fp8_kv
+            self._calibrate_fp8_kv()
+
         # piecewise CUDA Graph（对齐 vLLM #35162）：
         #   图外 recv → 图内 forward（读写静态 buffer）→ 图外 send
         # 与「整段 recv+层+send 录进一张图」相比：P2P 更稳，调度可与图解耦。
@@ -84,7 +108,15 @@ class ModelRunner:
             self.cuda_graph_runner = CUDAGraphRunner(
                 CUDAGraphRunner.make_bs_list(max_bs), device
             )
-            self.cuda_graph_runner.capture(self._decode_body)
+            # FP8 KV：录图期间 attention 走 CG wrapper（plan 已在 on_warmup 完成）
+            if self._fp8_kv is not None:
+                self._meta.fp8_kv_cg = True
+            self.cuda_graph_runner.capture(
+                self._decode_body,
+                on_warmup=(self._fp8_kv_plan_warmup if self._fp8_kv is not None else None),
+            )
+            if self._fp8_kv is not None:
+                self._meta.fp8_kv_cg = False
             if world.size > 1:
                 world.barrier()
 
@@ -100,6 +132,69 @@ class ModelRunner:
             residual=torch.empty(
                 n, self.hidden_size, dtype=self.dtype, device=self.device
             ),
+        )
+
+    # ------------------------------------------------------------------ #
+    # FP8 KV cache：校准 / 预热 / plan
+    # ------------------------------------------------------------------ #
+
+    def _fake_decode_batch(self, bs: int) -> None:
+        """构造 bs 行假 decode 批（cache_seqlens=1、页表指向 page 0）。
+
+        slot_mapping 全部有效（=0）：warmup 前向会真实写入 page 0，用于触发
+        各层 scale 校准；page 0 之后会被真实序列覆写，无副作用。
+        """
+        seqs = [
+            SeqSchedule(seq_id=-1, block_table=[0], num_cached_tokens=0, token_ids=[1])
+            for _ in range(bs)
+        ]
+        self.batch.build_decode(seqs)
+
+    def _calibrate_fp8_kv(self) -> None:
+        """录图前跑一次最小前向：校准各层 scale + 预热 FlashInfer 路径。
+
+        必须在 CUDA Graph capture 之前完成——captured 区域不能再写 scale
+        （replay 时会用新数据重算，导致存量 KV 的写/读 scale 不一致）。
+        """
+        self._fake_decode_batch(1)
+        self._fp8_kv.plan_decode(
+            1, self.batch.block_tables[:1], self.batch.cache_seqlens[:1], cg=False
+        )
+        with attention_context(self._meta):
+            self.model(
+                self.batch.input_ids[:1],
+                self.batch.positions[:1],
+                self._decode_attn(1),
+                None,
+            )
+        torch.cuda.synchronize(self.device)
+
+    def _fp8_kv_plan_warmup(self, bs: int) -> None:
+        """capture 每个 bs 前的 warmup 钩子：plan 该 bs 的 FlashInfer wrapper。
+
+        plan 内部有 D2H 拷贝，不能进图；在每个 bs 录图前执行一次，
+        captured 区域只含 wrapper.run（读 plan 写入的设备缓冲）。
+        """
+        self._fake_decode_batch(bs)
+        self._fp8_kv.plan_decode(
+            bs, self.batch.block_tables[:bs], self.batch.cache_seqlens[:bs], cg=True
+        )
+
+    def _plan_decode_fp8(self, bs: int, pad_to: int | None) -> None:
+        """decode 前 plan FlashInfer（录图外）；CG 补齐行做 KV 长度修正。"""
+        plan_bs = pad_to if pad_to is not None else bs
+        if pad_to is not None and pad_to > bs:
+            # CG 补齐行：KV 长度置 1、页表指向 page 0——FlashInfer 要求
+            # last_page_len ∈ [1, page_size]；补齐行输出本就被 hidden[:bs] 丢弃。
+            self.batch.cache_seqlens[bs:pad_to].fill_(1)
+            self.batch.block_tables[bs:pad_to].zero_()
+        # 走 CG replay 时 plan CG wrapper；eager（bs 超上限）plan 非 CG wrapper
+        use_cg = self.cuda_graph_runner is not None and bs <= self.max_bs
+        self._fp8_kv.plan_decode(
+            plan_bs,
+            self.batch.block_tables[:plan_bs],
+            self.batch.cache_seqlens[:plan_bs],
+            cg=use_cg,
         )
 
     def _pp_dst(self) -> int:
@@ -176,11 +271,15 @@ class ModelRunner:
             else None
         )
         self.batch.build_decode(seqs, pad_to=pad_to)
+        if self._fp8_kv is not None:
+            self._plan_decode_fp8(bs, pad_to)
 
         if self.cuda_graph_runner is not None and bs <= self.max_bs:
             if not self.is_first_pp:
                 self._recv_intermediate(bs, static=True)
+            self._meta.fp8_kv_cg = self._fp8_kv is not None
             hidden, _ = self.cuda_graph_runner.replay(bs)
+            self._meta.fp8_kv_cg = False
             if not self.is_last_pp:
                 self._send_intermediate(
                     IntermediateTensors(
@@ -228,6 +327,13 @@ class ModelRunner:
             return None
         n_tokens, max_q, max_k, has_cache = self.batch.build_prefill(seqs)
         bs = len(seqs)
+        if self._fp8_kv is not None and has_cache:
+            # 有前缀缓存：FlashInfer paged prefill 读 fp8 cache，需先 plan
+            self._fp8_kv.plan_prefill(
+                self.batch.cu_seqlens_q[: bs + 1],
+                self.batch.cu_seqlens_k[: bs + 1],
+                self.batch.block_tables[:bs],
+            )
         it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
 
         if self.prefill_fn is not None and all(
@@ -367,4 +473,7 @@ class ModelRunner:
         if self.cuda_graph_runner is not None:
             self.cuda_graph_runner.destroy()
             self.cuda_graph_runner = None
+        if self._fp8_kv is not None:
+            self._fp8_kv.destroy()
+            self._fp8_kv = None
         self.prefill_fn = None

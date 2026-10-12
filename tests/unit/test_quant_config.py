@@ -326,16 +326,18 @@ class TestEngineConfigQuant:
         with pytest.raises(ValueError, match="quantization must be"):
             EngineConfig(model=_write_model(tmp_path), quantization="nf4")
 
-    def test_kv_cache_flag_not_implemented(self, tmp_path):
-        """FP8 KV cache 尚未实现：显式报错而非静默失效。"""
+    def test_kv_cache_flag(self, tmp_path):
+        """quant_kv_cache=True → kv_cache_dtype 解析为 fp8（SM 门控在 Worker）。"""
+        import torch
+
         from src.config import EngineConfig
 
         path = _write_model(tmp_path, quantization_config=FP8_BLOCK)
-        with pytest.raises(NotImplementedError, match="quant_kv_cache"):
-            EngineConfig(model=path, quantization="auto", quant_kv_cache=True)
+        ec = EngineConfig(model=path, quantization="auto", quant_kv_cache=True)
+        assert ec.quant_config.kv_cache_dtype is torch.float8_e4m3fn
 
     def test_kv_cache_dtype_parsed(self, tmp_path):
-        """QuantConfig 层仍支持 kv_cache_dtype 透传（供后续阶段使用）。"""
+        """QuantConfig 层支持 kv_cache_dtype 透传。"""
         import torch
 
         from src.quant import QuantConfig

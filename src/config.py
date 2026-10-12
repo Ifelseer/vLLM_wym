@@ -133,14 +133,6 @@ class EngineConfig:
         if self.quantization == "none":
             return None
         capability = self._device_capability()
-        if self.quant_kv_cache:
-            # FP8 KV cache 依赖 FlashInfer attention wrapper（FA2 不支持），
-            # 在 fp8-kv-cache 阶段实现；此前显式报错而非静默失效。
-            raise NotImplementedError(
-                "quant_kv_cache=True is not implemented yet "
-                "(FP8 KV cache lands in the fp8-kv-cache phase); "
-                "keep quant_kv_cache=false"
-            )
         hf_qc = getattr(self.hf_config, "quantization_config", None)
         kv_dtype = (
             torch.float8_e4m3fn
