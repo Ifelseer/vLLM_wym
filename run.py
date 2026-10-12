@@ -66,6 +66,8 @@ DEFAULTS = {
     "nccl_ifname": "",
     "enable_ep": False,
     "moe_backend": "auto",
+    "quantization": "none",
+    "quant_kv_cache": False,
 }
 
 
@@ -99,6 +101,8 @@ def _make_engine(cfg: dict) -> Engine:
             nccl_ifname=cfg["nccl_ifname"],
             enable_ep=bool(cfg.get("enable_ep", False)),
             moe_backend=cfg.get("moe_backend", "auto"),
+            quantization=cfg.get("quantization", "none"),
+            quant_kv_cache=bool(cfg.get("quant_kv_cache", False)),
         )
     )
 
@@ -242,6 +246,21 @@ def main() -> None:
         help="fused MoE 后端（auto=SM89+ cutlass，否则 Triton）",
     )
     p.add_argument(
+        "--quantization",
+        choices=("none", "auto", "fp8", "int8", "awq", "gptq"),
+        default=None,
+        help=(
+            "量化方式：none=不量化；auto=按模型自带 quantization_config；"
+            "fp8/int8=W8A8（BF16 模型时加载时在线量化）；"
+            "awq/gptq=INT4 weight-only（需预量化 checkpoint）"
+        ),
+    )
+    p.add_argument(
+        "--quant-kv-cache",
+        action="store_true",
+        help="FP8 KV cache（仅 fp8 路径 + SM89+；自动切 FlashInfer attention）",
+    )
+    p.add_argument(
         "--pp-layer-counts",
         type=str,
         default=None,
@@ -296,6 +315,10 @@ def main() -> None:
         cfg["enable_ep"] = True
     if args.moe_backend is not None:
         cfg["moe_backend"] = args.moe_backend
+    if args.quantization is not None:
+        cfg["quantization"] = args.quantization
+    if args.quant_kv_cache:
+        cfg["quant_kv_cache"] = True
 
     if args.batch:
         run_batch(cfg)

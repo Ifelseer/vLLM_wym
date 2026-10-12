@@ -11,6 +11,7 @@ from ...distributed import (
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
 )
+from ...quant import get_quant_method
 
 # ==============================================================================
 # 模块说明：
@@ -56,10 +57,21 @@ def _shard(
 class ReplicatedLinear(nn.Module):
     """整份复制、无通信。MoE router / EP 下的 shared expert 用这个。"""
 
-    def __init__(self, in_size: int, out_size: int, *, bias: bool = False):
+    def __init__(self, in_size: int, out_size: int, *, bias: bool = False, quant=None):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_size, in_size))
-        setattr(self.weight, "weight_loader", self.weight_loader)
+        self.quant_method = get_quant_method(
+            quant,
+            kind="replicated",
+            out_size=out_size,
+            in_size=in_size,
+            tp_size=1,
+            tp_rank=0,
+        )
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        else:
+            self.weight = nn.Parameter(torch.empty(out_size, in_size))
+            setattr(self.weight, "weight_loader", self.weight_loader)
         if bias:
             self.bias = nn.Parameter(torch.empty(out_size))
             setattr(self.bias, "weight_loader", self.weight_loader)
@@ -70,6 +82,8 @@ class ReplicatedLinear(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quant_method is not None:
+            return self.quant_method.forward(x, self)
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
@@ -90,6 +104,7 @@ class ColumnParallelLinear(nn.Module):
         bias: bool = False,
         gather_output: bool = True,
         tp_size: int | None = None,
+        quant=None,
     ):
         super().__init__()
         self.in_size = in_size
@@ -97,18 +112,30 @@ class ColumnParallelLinear(nn.Module):
         self.gather_output = gather_output
         self._tp_size, self._tp_rank = _tp_meta(tp_size)
         self.output_size_per_partition = divide(out_size, self._tp_size)
-        # 初始化权重，仅持有当前 Rank 负责的权重部分
-        self.weight = nn.Parameter(
-            torch.empty(self.output_size_per_partition, in_size)
+        self.quant_method = get_quant_method(
+            quant,
+            kind="column",
+            out_size=self.output_size_per_partition,
+            in_size=in_size,
+            tp_size=self._tp_size,
+            tp_rank=self._tp_rank,
         )
+        if self.quant_method is not None:
+            # 量化权重与 scale buffer 由 QuantMethod 创建
+            self.quant_method.create_weights(self)
+        else:
+            # 初始化权重，仅持有当前 Rank 负责的权重部分
+            self.weight = nn.Parameter(
+                torch.empty(self.output_size_per_partition, in_size)
+            )
+            # 设置权重加载器
+            setattr(self.weight, "weight_loader", self.weight_loader)
         # 初始化偏置，仅持有当前 Rank 负责的偏置部分
         if bias:
             self.bias = nn.Parameter(torch.empty(self.output_size_per_partition))
             setattr(self.bias, "weight_loader", self.weight_loader)
         else:
             self.register_parameter("bias", None)
-        # 设置权重加载器
-        setattr(self.weight, "weight_loader", self.weight_loader)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int = 0
@@ -118,7 +145,10 @@ class ColumnParallelLinear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = torch.nn.functional.linear(x, self.weight, self.bias)
+        if self.quant_method is not None:
+            out = self.quant_method.forward(x, self)
+        else:
+            out = torch.nn.functional.linear(x, self.weight, self.bias)
 
         # 跨 TP 通信，将所有 Rank 的局部输出拼接为完整输出
         if self.gather_output:
@@ -147,6 +177,7 @@ class RowParallelLinear(nn.Module):
         input_is_parallel: bool = False,
         reduce_results: bool = True,
         tp_size: int | None = None,
+        quant=None,
     ):
         super().__init__()
         self.in_size = in_size
@@ -155,16 +186,27 @@ class RowParallelLinear(nn.Module):
         self.reduce_results = reduce_results
         self._tp_size, self._tp_rank = _tp_meta(tp_size)
         self.input_size_per_partition = divide(in_size, self._tp_size)
-        self.weight = nn.Parameter(
-            torch.empty(out_size, self.input_size_per_partition)
+        self.quant_method = get_quant_method(
+            quant,
+            kind="row",
+            out_size=out_size,
+            in_size=self.input_size_per_partition,
+            tp_size=self._tp_size,
+            tp_rank=self._tp_rank,
         )
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        else:
+            self.weight = nn.Parameter(
+                torch.empty(out_size, self.input_size_per_partition)
+            )
+            setattr(self.weight, "weight_loader", self.weight_loader)
         # 行并行的Bias是全量持有
         if bias:
             self.bias = nn.Parameter(torch.empty(out_size))
             setattr(self.bias, "weight_loader", self.weight_loader)
         else:
             self.register_parameter("bias", None)
-        setattr(self.weight, "weight_loader", self.weight_loader)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int = 0
@@ -180,7 +222,10 @@ class RowParallelLinear(nn.Module):
         if not self.input_is_parallel and self._tp_size > 1:
             shard = self.input_size_per_partition
             x = x.narrow(-1, self._tp_rank * shard, shard).contiguous()
-        out = torch.nn.functional.linear(x, self.weight)
+        if self.quant_method is not None:
+            out = self.quant_method.forward(x, self)
+        else:
+            out = torch.nn.functional.linear(x, self.weight)
         if self.reduce_results and self._tp_size > 1:
             out = tensor_model_parallel_all_reduce(out)
         # 加上偏置
@@ -209,6 +254,7 @@ class QKVParallelLinear(nn.Module):
         total_num_kv_heads: int,
         *,
         bias: bool = False,
+        quant=None,
     ):
         super().__init__()
         tp_size = get_tp_group().size
@@ -229,16 +275,33 @@ class QKVParallelLinear(nn.Module):
         self.q_size = self.num_heads * head_size
         self.kv_size = self.num_kv_heads * head_size
 
-        # 本地持有的融合权重形状: [q_size + 2*kv_size, hidden_size]
-        self.weight = nn.Parameter(
-            torch.empty(self.q_size + 2 * self.kv_size, hidden_size)
+        self.quant_method = get_quant_method(
+            quant,
+            kind="qkv",
+            out_size=self.q_size + 2 * self.kv_size,
+            in_size=hidden_size,
+            tp_size=tp_size,
+            tp_rank=get_tp_group().group_rank,
+            qkv_meta=(
+                total_num_heads,
+                total_num_kv_heads,
+                head_size,
+                self.num_kv_head_replicas,
+            ),
         )
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        else:
+            # 本地持有的融合权重形状: [q_size + 2*kv_size, hidden_size]
+            self.weight = nn.Parameter(
+                torch.empty(self.q_size + 2 * self.kv_size, hidden_size)
+            )
+            setattr(self.weight, "weight_loader", self.weight_loader)
         if bias:
             self.bias = nn.Parameter(torch.empty(self.q_size + 2 * self.kv_size))
             setattr(self.bias, "weight_loader", self.weight_loader)
         else:
             self.register_parameter("bias", None)
-        setattr(self.weight, "weight_loader", self.weight_loader)
 
     def _shard_qkv(
         self, loaded_weight: torch.Tensor, shard_id: str
@@ -300,6 +363,8 @@ class QKVParallelLinear(nn.Module):
         前向传播：直接进行融合矩阵乘法，不进行 Gather。
         返回的张量包含当前 Rank 负责的 [q_local | k_local | v_local]，由上层模型负责 Split。
         """
+        if self.quant_method is not None:
+            return self.quant_method.forward(x, self)
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 
@@ -318,6 +383,7 @@ class MergedColumnParallelLinear(nn.Module):
         *,
         bias: bool = False,
         tp_size: int | None = None,
+        quant=None,
     ):
         super().__init__()
         self.in_size = in_size
@@ -327,13 +393,25 @@ class MergedColumnParallelLinear(nn.Module):
             divide(s, self._tp_size) for s in output_sizes
         ]
         total = sum(self.output_sizes_per_partition)
-        self.weight = nn.Parameter(torch.empty(total, in_size))
+        self.quant_method = get_quant_method(
+            quant,
+            kind="merged_column",
+            out_size=total,
+            in_size=in_size,
+            tp_size=self._tp_size,
+            tp_rank=self._tp_rank,
+            merged_sizes=self.output_sizes_per_partition,
+        )
+        if self.quant_method is not None:
+            self.quant_method.create_weights(self)
+        else:
+            self.weight = nn.Parameter(torch.empty(total, in_size))
+            setattr(self.weight, "weight_loader", self.weight_loader)
         if bias:
             self.bias = nn.Parameter(torch.empty(total))
             setattr(self.bias, "weight_loader", self.weight_loader)
         else:
             self.register_parameter("bias", None)
-        setattr(self.weight, "weight_loader", self.weight_loader)
 
     def weight_loader(
         self, param: nn.Parameter, loaded_weight: torch.Tensor, shard_id: int
@@ -345,6 +423,8 @@ class MergedColumnParallelLinear(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quant_method is not None:
+            return self.quant_method.forward(x, self)
         return torch.nn.functional.linear(x, self.weight, self.bias)
 
 

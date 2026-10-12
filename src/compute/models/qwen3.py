@@ -17,6 +17,7 @@ from ..layers import (
 )
 from ..layers.attention import AttnInputs
 from ..layers.linear import get_weight_loader
+from ...quant import quant_for
 from ...distributed import (
     IntermediateTensors,
     PPMissingLayer,
@@ -42,20 +43,27 @@ def _parse_layer_idx(name: str) -> int | None:
 
 
 class Qwen3MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int):
+    def __init__(self, hidden_size: int, intermediate_size: int, quant=None):
         super().__init__()
 
         # 将 gate_proj 和 up_proj 融合为单一的 MergedColumnParallelLinear 层。
         # 在 TP 下沿输出维度进行切分，减少 kernel launch 开销。
         self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size, [intermediate_size, intermediate_size], bias=False
+            hidden_size,
+            [intermediate_size, intermediate_size],
+            bias=False,
+            quant=quant_for(quant, "mlp.gate_up_proj"),
         )
 
         # down_proj 采用行并行。
         # 由于 gate_up_proj 的输出已经是按 TP 切分的，因此 down_proj 的输入也是分片状态，
         # 需设置 input_is_parallel=True 避免底层触发不必要的 All-Gather 操作。
         self.down_proj = RowParallelLinear(
-            intermediate_size, hidden_size, bias=False, input_is_parallel=True
+            intermediate_size,
+            hidden_size,
+            bias=False,
+            input_is_parallel=True,
+            quant=quant_for(quant, "mlp.down_proj"),
         )
         self.act_fn = SiluAndMul()
 
@@ -77,6 +85,7 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         layer_id: int = 0,
         use_qk_norm: bool = True,
+        quant=None,
     ):
         super().__init__()
         self.head_dim = head_dim or hidden_size // num_heads
@@ -84,7 +93,12 @@ class Qwen3Attention(nn.Module):
 
         # 融合 QKV 投影层。在 TP 下，该层自动按注意力头进行切分并暴露出当前 rank 实际分配到的本地头数。
         self.qkv_proj = QKVParallelLinear(
-            hidden_size, self.head_dim, num_heads, num_kv_heads, bias=qkv_bias
+            hidden_size,
+            self.head_dim,
+            num_heads,
+            num_kv_heads,
+            bias=qkv_bias,
+            quant=quant_for(quant, "self_attn.qkv_proj"),
         )
         self.num_heads = self.qkv_proj.num_heads
         self.num_kv_heads = self.qkv_proj.num_kv_heads
@@ -98,6 +112,7 @@ class Qwen3Attention(nn.Module):
             self.qkv_proj.num_heads_total * self.head_dim,
             hidden_size,
             input_is_parallel=True,
+            quant=quant_for(quant, "self_attn.o_proj"),
         )
         self.rotary_emb = RotaryEmbedding(
             self.head_dim, self.head_dim, max_position, rope_theta
@@ -136,7 +151,7 @@ class Qwen3Attention(nn.Module):
 
 
 class Qwen3DecoderLayer(nn.Module):
-    def __init__(self, config: Qwen3Config, layer_id: int = 0):
+    def __init__(self, config: Qwen3Config, layer_id: int = 0, quant=None):
         super().__init__()
         self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
@@ -148,8 +163,9 @@ class Qwen3DecoderLayer(nn.Module):
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
             layer_id=layer_id,
+            quant=quant,
         )
-        self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size)
+        self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size, quant=quant)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -161,7 +177,7 @@ class Qwen3DecoderLayer(nn.Module):
 
 
 class Qwen3Model(nn.Module):
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, quant=None):
         super().__init__()
         pp = get_pp_group()
         # 获取当前 PP 负责处理的 Transformer 层区间 [start_layer, end_layer)
@@ -180,7 +196,7 @@ class Qwen3Model(nn.Module):
         # local_i 为当前 stage 内的相对层索引。
         self.layers = nn.ModuleList(
             [
-                Qwen3DecoderLayer(config, layer_id=local_i)
+                Qwen3DecoderLayer(config, layer_id=local_i, quant=quant)
                 for local_i in range(self.end_layer - self.start_layer)
             ]
         )
@@ -217,9 +233,9 @@ class Qwen3Model(nn.Module):
 
 class Qwen3ForCausalLM(nn.Module):
 
-    def __init__(self, config: Qwen3Config):
+    def __init__(self, config: Qwen3Config, quant=None):
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, quant=quant)
         # LM Head 放置在 PP 的最后一个 stage
         self.lm_head = (
             ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
@@ -267,6 +283,10 @@ class Qwen3ForCausalLM(nn.Module):
         params = dict(self.named_parameters())
         loaded = set()
         skipped = []
+        # 量化 checkpoint 中未量化模块（embed/lm_head）的 fp8 权重反量化
+        from utils.model_loader import Fp8FallbackCatcher, filter_unloaded_scales
+
+        catcher = Fp8FallbackCatcher(params)
 
         for name, w in weights:
             # 1. PP 层索引过滤和重映射
@@ -297,6 +317,10 @@ class Qwen3ForCausalLM(nn.Module):
                 break
             # 3. 处理普通权重
             else:
+                if catcher.is_pending_name(name) and catcher.feed(
+                    name, w, load_fn=get_weight_loader
+                ):
+                    continue
                 if name in params:
                     get_weight_loader(params[name])(params[name], w)
                     loaded.add(name)
@@ -308,7 +332,13 @@ class Qwen3ForCausalLM(nn.Module):
         # 如果 lm_head 未被显式加载，则复用 embed_tokens 的权重。
         # 注意：VocabParallelEmbedding 内部会多分配一行用于越界占位 (padding)，
         # 因此在复制给 lm_head 时需要切片跳过第一行 (embed[1:]) 以保证 shape 匹配。
-        unloaded = set(params) - loaded
+        loaded.update(catcher.written)
+        unresolved = catcher.unresolved()
+        if unresolved:
+            raise RuntimeError(
+                f"fp8 weights without matching weight_scale: {unresolved[:5]}"
+            )
+        unloaded = filter_unloaded_scales(self, set(params) - loaded)
         if "lm_head.weight" in unloaded and "model.embed_tokens.weight" in loaded:
             embed = params["model.embed_tokens.weight"].data
             params["lm_head.weight"].data.copy_(embed[1:])

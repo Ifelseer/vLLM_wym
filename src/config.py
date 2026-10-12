@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Literal
 
+import torch
 from transformers import AutoConfig, PretrainedConfig
+
+from .quant import QuantConfig
+from .quant.config import VALID_METHODS as _QUANT_VALID_METHODS
 
 
 def _is_moe_config(cfg: PretrainedConfig) -> bool:
@@ -60,8 +64,18 @@ class EngineConfig:
     enable_ep: bool = False
     moe_backend: Literal["auto", "cutlass", "triton"] = "auto"
 
+    # --- 量化 ---
+    # none / auto / fp8 / int8 / awq / gptq：
+    #   auto = 模型自带 quantization_config 就按它解析，否则不量化；
+    #   fp8/int8 = 强制该方法（BF16 checkpoint 时加载时在线量化）；
+    #   awq/gptq = 强制 INT4 weight-only（必须搭配预量化 checkpoint）。
+    quantization: str = "none"
+    # FP8 KV cache（仅 fp8 路径生效，SM89+；FA2 不支持，走 FlashInfer wrapper）
+    quant_kv_cache: bool = False
+
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
+    quant_config: QuantConfig | None = field(init=False, default=None)
 
     def __post_init__(self) -> None:
         self.model = os.path.expanduser(self.model)
@@ -82,8 +96,14 @@ class EngineConfig:
             raise ValueError(
                 f"moe_backend must be auto|cutlass|triton, got {self.moe_backend!r}"
             )
+        if self.quantization not in _QUANT_VALID_METHODS:
+            raise ValueError(
+                f"quantization must be none|auto|fp8|int8|awq|gptq, "
+                f"got {self.quantization!r}"
+            )
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.is_moe = _is_moe_config(self.hf_config)
+        self.quant_config = self._resolve_quant()
         text = getattr(self.hf_config, "text_config", self.hf_config)
         self.context_len = min(
             self.context_len,
@@ -99,6 +119,83 @@ class EngineConfig:
             "True",
         ):
             self.enforce_eager = True
+
+    def _resolve_quant(self) -> QuantConfig | None:
+        """解析量化配置（EngineConfig.quantization + HF quantization_config）。
+
+        规则：
+        - ``none``            → 不量化。
+        - ``auto``            → 模型自带 quantization_config 就按它解析。
+        - ``awq`` / ``gptq``  → 必须搭配同方法的预量化 checkpoint。
+        - ``fp8`` / ``int8``  → checkpoint 已是同方法则按其格式；
+                                否则对 BF16 checkpoint 在线量化（加载时）。
+        """
+        if self.quantization == "none":
+            return None
+        capability = self._device_capability()
+        if self.quant_kv_cache:
+            # FP8 KV cache 依赖 FlashInfer attention wrapper（FA2 不支持），
+            # 在 fp8-kv-cache 阶段实现；此前显式报错而非静默失效。
+            raise NotImplementedError(
+                "quant_kv_cache=True is not implemented yet "
+                "(FP8 KV cache lands in the fp8-kv-cache phase); "
+                "keep quant_kv_cache=false"
+            )
+        hf_qc = getattr(self.hf_config, "quantization_config", None)
+        kv_dtype = (
+            torch.float8_e4m3fn
+            if self.quant_kv_cache and self.quantization in ("auto", "fp8")
+            else None
+        )
+        if self.quantization == "auto":
+            return QuantConfig.from_hf_config(
+                self.hf_config,
+                device_capability=capability,
+                kv_cache_dtype=kv_dtype,
+            )
+        if self.quantization in ("awq", "gptq"):
+            if hf_qc is None:
+                raise ValueError(
+                    f"quantization={self.quantization} requires a pre-quantized "
+                    f"checkpoint (HF quantization_config); none found in {self.model}"
+                )
+            d = hf_qc.to_dict() if hasattr(hf_qc, "to_dict") else dict(hf_qc)
+            if d.get("quant_method") != self.quantization:
+                raise ValueError(
+                    f"quantization={self.quantization} but checkpoint is "
+                    f"{d.get('quant_method')!r}; use quantization=auto or match "
+                    "the checkpoint"
+                )
+            return QuantConfig.from_hf_config(
+                self.hf_config, device_capability=capability
+            )
+        # fp8 / int8：checkpoint 已是同方法 → 按 checkpoint 格式（尊重其 scale
+        # 模式与 modules_to_not_convert）；否则加载时在线量化。
+        if hf_qc is not None:
+            d = hf_qc.to_dict() if hasattr(hf_qc, "to_dict") else dict(hf_qc)
+            if d.get("quant_method") == self.quantization:
+                cfg = QuantConfig.from_hf_config(
+                    self.hf_config, device_capability=capability
+                )
+                if kv_dtype is not None and cfg.kv_cache_dtype is None:
+                    cfg = replace(cfg, kv_cache_dtype=kv_dtype)
+                return cfg
+        return QuantConfig.from_name(
+            self.quantization,
+            device_capability=capability,
+            kv_cache_dtype=kv_dtype,
+            quantize_at_load=True,
+        )
+
+    @staticmethod
+    def _device_capability() -> tuple[int, int]:
+        """当前默认 GPU 的 (major, minor)；无 CUDA 时返回 (0, 0)（未知）。"""
+        if torch.cuda.is_available():
+            try:
+                return torch.cuda.get_device_capability()
+            except Exception:  # pragma: no cover - 驱动异常等
+                pass
+        return (0, 0)
 
     def _validate_parallel(self, text: PretrainedConfig) -> None:
         n_heads = int(text.num_attention_heads)

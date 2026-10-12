@@ -13,6 +13,7 @@ from ..compute.layers import (
     SiluAndMul,
 )
 from ..distributed import get_tp_group, tensor_model_parallel_all_reduce
+from ..quant import quant_for
 from .experts import Experts
 from .parallel import MoEParallelConfig
 
@@ -31,7 +32,7 @@ def route_experts(
 
 
 class SparseMoeBlock(nn.Module):
-    def __init__(self, config, parallel: MoEParallelConfig) -> None:
+    def __init__(self, config, parallel: MoEParallelConfig, quant=None) -> None:
         super().__init__()
         self.parallel = parallel
         hidden = config.hidden_size
@@ -40,16 +41,19 @@ class SparseMoeBlock(nn.Module):
         self.norm_topk_prob = bool(getattr(config, "norm_topk_prob", False))
         self.use_ep = parallel.use_ep
 
+        # router gate 不量化（精度敏感 + 体积极小）；checkpoint 的
+        # modules_to_not_convert 通常也含 mlp.gate
         self.gate = ReplicatedLinear(hidden, self.num_experts, bias=False)
         self.experts = Experts(
             self.num_experts,
             hidden,
             int(config.moe_intermediate_size),
             parallel,
+            quant=quant_for(quant, "mlp.experts"),
         )
-        self._init_shared_expert(config, hidden)
+        self._init_shared_expert(config, hidden, quant)
 
-    def _init_shared_expert(self, config, hidden: int) -> None:
+    def _init_shared_expert(self, config, hidden: int, quant=None) -> None:
         shared_inter = int(getattr(config, "shared_expert_intermediate_size", 0) or 0)
         if shared_inter <= 0:
             self.shared_expert_gate = None
@@ -59,9 +63,14 @@ class SparseMoeBlock(nn.Module):
             return
         # EP: replicate shared; add after routed AR so it is not summed ep times.
         shard_tp = 1 if self.use_ep else None
+        # sigmoid 门（hidden→1）不量化
         self.shared_expert_gate = ReplicatedLinear(hidden, 1, bias=False)
         self.shared_expert_gate_up = MergedColumnParallelLinear(
-            hidden, [shared_inter] * 2, bias=False, tp_size=shard_tp
+            hidden,
+            [shared_inter] * 2,
+            bias=False,
+            tp_size=shard_tp,
+            quant=quant_for(quant, "mlp.shared_expert.gate_up_proj"),
         )
         self.shared_expert_down = RowParallelLinear(
             shared_inter,
@@ -70,6 +79,7 @@ class SparseMoeBlock(nn.Module):
             reduce_results=False,
             tp_size=shard_tp,
             input_is_parallel=not self.use_ep,
+            quant=quant_for(quant, "mlp.shared_expert.down_proj"),
         )
         self.shared_activation = SiluAndMul()
 

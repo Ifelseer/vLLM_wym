@@ -56,6 +56,8 @@ DEFAULTS = {
     "nccl_ifname": "",
     "enable_ep": False,
     "moe_backend": "auto",
+    "quantization": "none",
+    "quant_kv_cache": False,
 }
 
 
@@ -108,6 +110,10 @@ def _load_config(args: argparse.Namespace) -> EngineConfig:
         nccl_ifname=cfg["nccl_ifname"],
         enable_ep=bool(args.ep or cfg.get("enable_ep", False)),
         moe_backend=args.moe_backend or cfg.get("moe_backend", "auto"),
+        quantization=args.quantization or cfg.get("quantization", "none"),
+        quant_kv_cache=bool(
+            args.quant_kv_cache or cfg.get("quant_kv_cache", False)
+        ),
     )
 
 
@@ -177,6 +183,17 @@ def main() -> None:
         "--moe-backend",
         choices=("auto", "cutlass", "triton"),
         default=None,
+    )
+    p.add_argument(
+        "--quantization",
+        choices=("none", "auto", "fp8", "int8", "awq", "gptq"),
+        default=None,
+        help="量化方式：none/auto/fp8/int8/awq/gptq（见 config.yaml 注释）",
+    )
+    p.add_argument(
+        "--quant-kv-cache",
+        action="store_true",
+        help="FP8 KV cache（尚未实现，占位）",
     )
     args = p.parse_args()
 

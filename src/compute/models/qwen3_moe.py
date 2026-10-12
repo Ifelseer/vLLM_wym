@@ -10,6 +10,7 @@ from transformers import PretrainedConfig
 from ...distributed import PPMissingLayer, get_pp_group, get_pp_indices
 from ...moe import SparseMoeBlock
 from ...moe.parallel import MoEParallelConfig
+from ...quant import quant_for
 from ..layers import RMSNorm, ParallelLMHead, VocabParallelEmbedding
 from ..layers.attention import AttnInputs
 from ..layers.linear import get_weight_loader
@@ -61,6 +62,7 @@ class Qwen3MoeDecoderLayer(nn.Module):
         layer_id: int,
         global_layer_id: int,
         parallel: MoEParallelConfig,
+        quant=None,
     ):
         super().__init__()
         self.self_attn = Qwen3Attention(
@@ -74,11 +76,14 @@ class Qwen3MoeDecoderLayer(nn.Module):
             head_dim=getattr(config, "head_dim", None),
             layer_id=layer_id,
             use_qk_norm=_use_qk_norm(config),
+            quant=quant,
         )
         if _is_moe_layer(config, global_layer_id):
-            self.mlp = SparseMoeBlock(config, parallel)
+            self.mlp = SparseMoeBlock(config, parallel, quant=quant)
         else:
-            self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size)
+            self.mlp = Qwen3MLP(
+                config.hidden_size, config.intermediate_size, quant=quant
+            )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -92,7 +97,12 @@ class Qwen3MoeDecoderLayer(nn.Module):
 
 
 class Qwen3MoeModel(Qwen3Model):
-    def __init__(self, config: PretrainedConfig, parallel: MoEParallelConfig):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        parallel: MoEParallelConfig,
+        quant=None,
+    ):
         nn.Module.__init__(self)
         pp = get_pp_group()
         self.start_layer, self.end_layer = get_pp_indices(
@@ -110,6 +120,7 @@ class Qwen3MoeModel(Qwen3Model):
                     layer_id=local_i,
                     global_layer_id=self.start_layer + local_i,
                     parallel=parallel,
+                    quant=quant,
                 )
                 for local_i in range(self.end_layer - self.start_layer)
             ]
@@ -122,11 +133,16 @@ class Qwen3MoeModel(Qwen3Model):
 
 
 class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
-    def __init__(self, config: PretrainedConfig, parallel: MoEParallelConfig):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        parallel: MoEParallelConfig,
+        quant=None,
+    ):
         nn.Module.__init__(self)
         self.config = config
         self.parallel = parallel
-        self.model = Qwen3MoeModel(config, parallel)
+        self.model = Qwen3MoeModel(config, parallel, quant=quant)
         self.lm_head = (
             ParallelLMHead(config.hidden_size, config.vocab_size, bias=False)
             if get_pp_group().is_last_rank
@@ -151,17 +167,31 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
         coverage: dict[str, set[tuple[int, str]]],
     ) -> bool:
         m = re.search(
-            r"(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$",
+            r"(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight(_scale)?$",
             name,
         )
         if not m:
             return False
         prefix, expert_id_s, proj = m.group(1), m.group(2), m.group(3)
+        is_scale = m.group(4) is not None
         expert_id = int(expert_id_s)
         experts = self._experts_module(name)
         if experts is None:
             return True
         if experts._local_id(expert_id) is None:
+            return True
+        if is_scale:
+            # FP8 预量化 checkpoint 的 per-expert block scale
+            if getattr(experts, "quant", None) is None:
+                return True
+            if proj in ("gate_proj", "up_proj"):
+                experts.weight_loader_w13_scale(
+                    experts.w13_scale, loaded_weight, f"{proj}.weight", expert_id
+                )
+            else:
+                experts.weight_loader_w2_scale(
+                    experts.w2_scale, loaded_weight, expert_id
+                )
             return True
         coverage.setdefault(prefix, set()).add((expert_id, proj))
         if proj in ("gate_proj", "up_proj"):
@@ -183,13 +213,33 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
         loaded: set[str],
         fused_coverage: dict[str, set[str]],
     ) -> bool:
-        is_w13 = ".mlp.experts.gate_up_proj" in name and loaded_weight.dim() == 3
+        is_scale = name.endswith(".weight_scale")
+        is_w13 = (
+            ".mlp.experts.gate_up_proj" in name
+            and loaded_weight.dim() == 3
+            and not is_scale
+        )
         is_w2 = (
             ".mlp.experts.down_proj" in name
             and loaded_weight.dim() == 3
             and not re.search(r"experts\.\d+\.", name)
+            and not is_scale
         )
         if not (is_w13 or is_w2):
+            # 3D 融合权重的 scale：[E, 2i/128, h/128] / [E, h/128, i/128]
+            if is_scale and loaded_weight.dim() == 3:
+                if ".mlp.experts.gate_up_proj" in name:
+                    experts = self._experts_module(name)
+                    if experts is not None:
+                        experts.load_fused_w13_scale(loaded_weight)
+                    return True
+                if ".mlp.experts.down_proj" in name and not re.search(
+                    r"experts\.\d+\.", name
+                ):
+                    experts = self._experts_module(name)
+                    if experts is not None:
+                        experts.load_fused_w2_scale(loaded_weight)
+                    return True
             return False
         marker = ".gate_up_proj" if is_w13 else ".down_proj"
         prefix = name.split(marker, 1)[0]
@@ -260,6 +310,10 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
         loaded: set[str] = set()
         expert_coverage: dict[str, set[tuple[int, str]]] = {}
         fused_coverage: dict[str, set[str]] = {}
+        # 量化 checkpoint 中未量化模块（embed/lm_head/router）的 fp8 权重反量化
+        from utils.model_loader import Fp8FallbackCatcher, filter_unloaded_scales
+
+        catcher = Fp8FallbackCatcher(params)
 
         for name, w in weights:
             layer_idx = _parse_layer_idx(name)
@@ -312,10 +366,20 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
                 if hit:
                     continue
             if name in params:
+                if catcher.is_pending_name(name) and catcher.feed(
+                    name, w, load_fn=get_weight_loader
+                ):
+                    continue
                 get_weight_loader(params[name])(params[name], w)
                 loaded.add(name)
 
-        unloaded = set(params) - loaded
+        loaded.update(catcher.written)
+        if catcher.unresolved():
+            raise RuntimeError(
+                f"fp8 weights without matching weight_scale: "
+                f"{catcher.unresolved()[:5]}"
+            )
+        unloaded = filter_unloaded_scales(self, set(params) - loaded)
         if "lm_head.weight" in unloaded and "model.embed_tokens.weight" in loaded:
             embed = params["model.embed_tokens.weight"].data
             params["lm_head.weight"].data.copy_(embed[1:])

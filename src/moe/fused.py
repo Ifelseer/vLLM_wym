@@ -1,4 +1,10 @@
-"""Fused MoE forward: FlashInfer cutlass (SM89+) or Triton GEMM."""
+"""Fused MoE forward: FlashInfer cutlass (SM89+) or Triton GEMM.
+
+FP8 block-scale 路径（``w13_scale`` 非 None）：
+- FlashInfer cutlass 的 block-scale FP8 MoE 仅 SM90+ 支持（vLLM 同款门控），
+  SM89 上强制走 Triton grouped GEMM（block scale 版，见 kernels/triton.py）；
+- cutlass 的 per-tensor FP8（quant_scales）路径保留给后续 per-tensor checkpoint。
+"""
 
 from __future__ import annotations
 
@@ -76,7 +82,29 @@ def fused_moe_forward(
     topk_weights: torch.Tensor,
     w13_weight: torch.Tensor,
     w2_weight: torch.Tensor,
+    w13_scale: torch.Tensor | None = None,
+    w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    quantized = w13_scale is not None
+    if quantized:
+        # FP8 block-scale：cutlass 仅 SM90 支持 block scale → 统一 Triton
+        if backend == "cutlass":
+            major, minor = torch.cuda.get_device_capability(hidden_states.device)
+            if major * 10 + minor >= 90:
+                raise NotImplementedError(
+                    "fp8 block-scale MoE via cutlass (SM90+) is not wired yet; "
+                    "use --moe-backend triton"
+                )
+            # SM89 及以下：Triton block-scale grouped GEMM
+        return triton_moe.forward(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+        )
     if backend == "cutlass":
         return _cutlass(
             hidden_states=hidden_states,

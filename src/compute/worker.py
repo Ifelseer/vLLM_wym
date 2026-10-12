@@ -132,9 +132,15 @@ class Worker:
                         enable_ep=self.config.enable_ep,
                         fused_backend=backend,
                     )
-                    model = Qwen3MoeForCausalLM(self.config.hf_config, parallel=parallel)
+                    model = Qwen3MoeForCausalLM(
+                        self.config.hf_config,
+                        parallel=parallel,
+                        quant=self.config.quant_config,
+                    )
                 else:
-                    model = Qwen3ForCausalLM(self.config.hf_config)
+                    model = Qwen3ForCausalLM(
+                        self.config.hf_config, quant=self.config.quant_config
+                    )
         load_model(model, self.config.model)
         return model.to(dtype=self.dtype, device=self.device).eval()
 

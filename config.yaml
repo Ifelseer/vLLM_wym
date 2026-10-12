@@ -50,6 +50,17 @@ nccl_ifname: ""  # 多机网卡名（如 ib0/eth0）；空=自动探测
 enable_ep: false          # true=在现有 TP ranks 上按 expert 切分（不扩大 world）
 moe_backend: "auto"       # auto / cutlass / triton；MoE 可开 --cg（workspace 池化）
 
+# --- 量化 ---
+# none = 不量化（默认，行为与旧版本完全一致）
+# auto = 模型自带 quantization_config 就按它解析（社区预量化 checkpoint）
+# fp8  = W8A8 FP8（e4m3）；BF16 checkpoint 时加载时在线量化（per-block 128x128）
+# int8 = W8A8 INT8（per-token 激活 × per-channel 权重）
+# awq / gptq = INT4 weight-only（必须搭配对应格式的预量化 checkpoint）
+quantization: "none"
+# FP8 KV cache：仅 fp8 路径 + SM89+（Ada/Hopper/Blackwell）生效；
+# FA2 不支持 FP8 KV，开启后 decode/prefill 自动切 FlashInfer attention wrapper。
+quant_kv_cache: false
+
 # --- 分布式 CG / compile（torchrun 多机路径同样生效）---
 # enforce_eager: false → decode piecewise CUDA Graph（PP 时 recv/send 图外）；
 # torch_compile: true → prefill torch.compile（含 TP 时用 max-autotune-no-cudagraphs）。

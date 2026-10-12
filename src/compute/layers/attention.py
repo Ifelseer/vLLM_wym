@@ -6,9 +6,23 @@ from typing import NamedTuple, Optional
 
 import torch
 import torch.nn as nn
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+
+    _HAS_FLASH_ATTN = True
+except ImportError:  # pragma: no cover - 开发机（Windows/CPU）无 flash_attn
+    _HAS_FLASH_ATTN = False
 
 from ..kv_ops import store_kvcache
+
+
+def _require_flash_attn() -> None:
+    if not _HAS_FLASH_ATTN:
+        raise RuntimeError(
+            "flash-attn is required by vllm::attention; "
+            "install flash-attn on a CUDA machine"
+        )
 
 class AttnInputs(NamedTuple):
     slot_mapping: torch.Tensor
@@ -60,6 +74,7 @@ def attention(
 ) -> torch.Tensor:
     meta = _ATTN_META
     assert meta is not None, "attention_context() not active"
+    _require_flash_attn()
     pool = meta.kv_cache
     k_cache = pool[0, layer_id]
     v_cache = pool[1, layer_id]

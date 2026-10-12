@@ -337,6 +337,15 @@ class ModelRunner:
         return self.model(input_ids, positions, attn, intermediate_tensors)
 
     def _build_compiled_prefill(self):
+        # 量化路径下 prefill 编译暂不启用：Dynamo × Triton autotune kernel
+        # （fp8 per-block GEMM）的交互尚未验证，正确性优先，回退 eager prefill。
+        # 待 4090 验证后开放（quant_config 非 None 即门控）。
+        if getattr(self.config, "quant_config", None) is not None:
+            print(
+                "[WARN] prefill torch.compile disabled under quantization "
+                "(unverified Dynamo x Triton-fp8 interaction; eager prefill)"
+            )
+            return None
         fn = torch.compile(
             self._prefill_forward,
             mode=self._resolve_compile_mode(),
