@@ -151,6 +151,7 @@ python run.py --model Qwen3-0.6B --dp 2 --batch --cg
 | [docs/moe.md](docs/moe.md) | 稀疏专家、路由与 grouped GEMM 融合、权重布局、后端选择 |
 | [docs/parallelism.md](docs/parallelism.md) | TP / PP / DP / EP 与 NCCL·Gloo·ZMQ 通信 |
 | [docs/performance.md](docs/performance.md) | 基准方法、本引擎与官方 vLLM 对比 |
+| [docs/parallel-benchmark.md](docs/parallel-benchmark.md) | 两套机器多卡并行实测：Graph / compile 收益、TP / PP / DP 切分选择、与官方 vLLM 对照 |
 
 ## 测试
 

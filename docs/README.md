@@ -8,6 +8,7 @@
 | [moe.md](moe.md) | 稀疏专家：路由、grouped GEMM 融合、权重布局、后端选择、CUDA Graph 集成 |
 | [parallelism.md](parallelism.md) | TP / PP / DP / EP 切分方式与 NCCL·Gloo·ZMQ 通信 |
 | [performance.md](performance.md) | 基准方法、本引擎端到端结果、与官方 vLLM 对比 |
+| [parallel-benchmark.md](parallel-benchmark.md) | 两套机器上的多卡并行实测：CUDA Graph / compile 收益、TP / PP / DP 切分选择、与官方 vLLM 对照 |
 
 ## 代码地图
 
@@ -19,6 +20,6 @@
 | [`src/moe/`](../src/moe/) | 稀疏专家：`SparseMoeBlock`、`Experts`、`fused_moe_forward`（cutlass / triton）、`MoEParallelConfig` |
 | [`src/distributed/`](../src/distributed/) | 进程组（TP/PP）、NCCL 集合通信、PP 点对点、控制通道 |
 
-配图位于 [`posts/`](posts/)，均为本实现生成的示意图，可用 `python docs/posts/gen_moe_figs.py` 重新生成。
+配图位于 [`posts/`](posts/)，均为本实现生成的示意图，可用 `python docs/posts/gen_moe_figs.py` 重新生成；[`figures/`](figures/) 存放 [parallel-benchmark.md](parallel-benchmark.md) 的实测图，用 `python docs/figures/gen_ieee_figs.py` 重新生成。
 
 测试默认模型与覆盖矩阵见 [`tests/README.md`](../tests/README.md)；性能基准见 [`bench/README.md`](../bench/README.md)。
