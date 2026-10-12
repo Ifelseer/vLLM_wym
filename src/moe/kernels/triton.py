@@ -21,6 +21,9 @@ _FP8 = torch.float8_e4m3fn
 _FP8_MAX = 448.0
 _GROUP = 128
 
+# Triton 3.x 只允许内核引用 constexpr 全局；host 侧仍用上面的普通常量
+_K_GROUP = tl.constexpr(_GROUP)
+
 
 def clear_state() -> None:
     _WS.clear()
@@ -128,7 +131,7 @@ def _gemm_kernel(
     )
     # per-block scale 索引：激活 [row, k_group]，权重 [expert, n_block, k_group]
     # n_blk 需 clamp：offs_n 可能越过 N（被 mask 的列），其输出本就被丢弃
-    n_blk = tl.minimum(offs_n // _GROUP, (N // _GROUP) - 1)
+    n_blk = tl.minimum(offs_n // _K_GROUP, (N // _K_GROUP) - 1)
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _k in range(0, tl.cdiv(K, BLOCK_K)):
@@ -144,7 +147,7 @@ def _gemm_kernel(
             other=0.0,
         )
         if use_scale:
-            k_blk = k // _GROUP
+            k_blk = k // _K_GROUP
             a_s = tl.load(a_s_ptr + a_row * stride_asm + k_blk * stride_ask)
             w_s = tl.load(
                 b_s_ptr

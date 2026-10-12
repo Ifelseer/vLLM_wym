@@ -28,6 +28,10 @@ FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = 448.0
 SCALE_BLOCK = 128  # per-block scale 网格边长（weight 128x128 / act 1x128）
 
+# Triton 3.x 只允许内核引用 constexpr 全局；host 侧仍用上面的普通常量
+_K_SCALE_BLOCK = tl.constexpr(SCALE_BLOCK)
+_K_FP8_MAX = tl.constexpr(FP8_MAX)
+
 
 def quantize_fp8_per_tensor(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """整张量静态量化（测试 / cutlass MoE per-tensor 路径用）。"""
@@ -142,24 +146,28 @@ def _w8a8_block_fp8_kernel(
     x_ptrs = X + (offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk)
     w_ptrs = W + (offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk)
 
+    # M/N 非 BLOCK 整数倍时块尾会越出张量，load 必须与 store 用同一套掩码
+    m_mask = offs_m[:, None] < M
+    n_mask = offs_n[:, None] < N
+
     # BLOCK_N/BLOCK_K 均为 128 的因数 → 权重 scale 网格索引按 program 对齐
-    ws_n = (n_start // SCALE_BLOCK) * stride_wsn
+    ws_n = (n_start // _K_SCALE_BLOCK) * stride_wsn
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for k in range(0, K, BLOCK_K):
         if EVEN_K:
-            x = tl.load(x_ptrs)
-            w = tl.load(w_ptrs)
+            x = tl.load(x_ptrs, mask=m_mask, other=0.0)
+            w = tl.load(w_ptrs, mask=n_mask, other=0.0)
         else:
             k_mask = offs_k[None, :] + k < K
-            x = tl.load(x_ptrs, mask=k_mask, other=0.0)
-            w = tl.load(w_ptrs, mask=k_mask, other=0.0)
-        w_scale = tl.load(WS + ws_n + (k // SCALE_BLOCK) * stride_wsk)
+            x = tl.load(x_ptrs, mask=m_mask & k_mask, other=0.0)
+            w = tl.load(w_ptrs, mask=n_mask & k_mask, other=0.0)
+        w_scale = tl.load(WS + ws_n + (k // _K_SCALE_BLOCK) * stride_wsk)
 
         # 激活动态量化：per-token × per-128-k-group（BLOCK_K == 128 对齐组宽）
         x_amax = tl.max(tl.abs(x), axis=1)
-        x_q = (x / x_amax[:, None] * FP8_MAX).to(tl.float8e4nv)
-        a_s = x_amax / FP8_MAX
+        x_q = (x / x_amax[:, None] * _K_FP8_MAX).to(tl.float8e4nv)
+        a_s = x_amax / _K_FP8_MAX
 
         # W 已是 fp8；tl.dot 走 FP8 tensor core（SM89+），fp32 累加
         acc += tl.dot(x_q, tl.trans(w)) * (a_s[:, None] * w_scale)
@@ -234,14 +242,20 @@ def w8a8_tensor_fp8_matmul(
     """
     a_scale = (x.abs().amax(dim=-1).clamp(min=1e-12) / FP8_MAX).to(torch.float32)
     a_q = (x / a_scale[:, None]).to(FP8_DTYPE)
-    ws = w_scale.reshape(())
     if out is None:
         out = torch.empty((x.shape[0], w_fp8.shape[0]), dtype=x.dtype, device=x.device)
+    if x.shape[0] == 0:
+        return out
+    # _scaled_mm 只接受 per-tensor × per-tensor 或 rowwise × colwise 两种 recipe：
+    # per-token 激活 scale（[M,1]）配标量权重 scale 会被判 "Invalid scaling
+    # configuration"。把标量权重 scale 广播成连续的 [1,N] 即落在 rowwise × colwise
+    # 上，与 a_s ⊗ w_scale 数学等价（且须连续，stride-0 的 expand 视图同样被拒）。
+    scale_b = w_scale.reshape(1, 1).expand(1, w_fp8.shape[0]).contiguous()
     torch._scaled_mm(
         a_q,
         w_fp8.t(),  # [K, N] column-major view（_scaled_mm 要求）
         scale_a=a_scale.view(-1, 1),
-        scale_b=ws,
+        scale_b=scale_b,
         out_dtype=out.dtype,
         out=out,
     )

@@ -58,7 +58,10 @@ for M in (1, 7, 128, 512):
     ref = F.linear(x, w)
     e = rel(out, ref)
     assert out.shape == (M, N) and out.dtype == dtype, (out.shape, out.dtype)
-    assert e < 0.03, f"block fp8 M={M} rel={e:.4f}"
+    # e4m3 的固有误差下限：权重量化与激活量化各贡献 mean ~4.5%，合计 max ~4%
+    # （误差随点积按 sqrt(K) 同步增长，不会被平均掉）。实测 M=1..512 为 0.033~0.039，
+    # 20 个随机种子最大 0.048，故取 0.08 留约 1.7x 余量；漏做 scale 校正会到 >0.10。
+    assert e < 0.08, f"block fp8 M={M} rel={e:.4f}"
     print(f"block fp8  M={M:<4d} rel={e:.4f}")
 
 # 输出缓冲池化（CUDA Graph replay 语义：同形复用）
@@ -78,7 +81,7 @@ wq, ws = quantize_fp8_per_tensor(w)
 out = w8a8_tensor_fp8_matmul(x, wq, ws)
 e = rel(out, F.linear(x, w))
 assert out.shape == (64, 1024) and out.dtype == dtype
-assert e < 0.03, f"tensor fp8 rel={e:.4f}"
+assert e < 0.08, f"tensor fp8 rel={e:.4f}"  # 同 block：e4m3 固有误差，实测 0.0314~0.0424
 print(f"tensor fp8          rel={e:.4f}")
 
 # ---------------------------------------------------------------- #
@@ -100,7 +103,9 @@ ref = fused_moe_forward(
     topk_weights=weights,
     w13_weight=w13,
     w2_weight=w2,
-)
+).clone()
+# 必须 clone：fused_moe_forward 返回按形状池化的复用缓冲（调用方须立即消费），
+# 不 clone 的话下面 fp8 那次调用会原地覆写 ref，rel(got, ref) 恒为 0（假通过）。
 
 # per-expert per-block 量化（与 Experts 加载产物同布局）
 w13q = torch.empty(E, 2 * i, h, device=dev, dtype=FP8)
@@ -127,7 +132,7 @@ got = fused_moe_forward(
 )
 e = rel(got, ref)
 assert got.shape == ref.shape and got.dtype == dtype
-assert e < 0.06, f"moe fp8 rel={e:.4f}"
+assert e < 0.12, f"moe fp8 rel={e:.4f}"  # 两个 GEMM + 中间激活量化叠加，实测 0.0645
 print(f"moe fp8 (M={M})     rel={e:.4f}")
 
 # decode 形状（M=1，CUDA Graph replay 的主场景）
@@ -139,7 +144,7 @@ ref1 = fused_moe_forward(
     topk_weights=weights[:1],
     w13_weight=w13,
     w2_weight=w2,
-)
+).clone()  # 同上：否则会被 got1 原地覆写
 got1 = fused_moe_forward(
     backend="triton",
     hidden_states=x1,
@@ -151,7 +156,7 @@ got1 = fused_moe_forward(
     w2_scale=w2s,
 )
 e1 = rel(got1, ref1)
-assert e1 < 0.06, f"moe fp8 M=1 rel={e1:.4f}"
+assert e1 < 0.12, f"moe fp8 M=1 rel={e1:.4f}"
 print(f"moe fp8 (M=1)       rel={e1:.4f}")
 
 print("ALL FP8 KERNEL TESTS PASSED")

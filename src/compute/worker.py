@@ -142,7 +142,27 @@ class Worker:
                         self.config.hf_config, quant=self.config.quant_config
                     )
         load_model(model, self.config.model)
-        return model.to(dtype=self.dtype, device=self.device).eval()
+        return self._to_device(model).eval()
+
+    def _to_device(self, model: torch.nn.Module) -> torch.nn.Module:
+        """搬到目标设备，并把激活 dtype 应用到普通参数。
+
+        量化参数（fp8 权重 / fp32 scale 等）由 quant_method 创建、自带 dtype，
+        不能被激活 dtype 覆盖：``load_model`` 已在 ``finalize_model`` 里完成量化，
+        整体 ``.to(dtype=...)`` 会把 fp8 权重与 fp32 scale 一并转成激活 dtype。
+        """
+        model = model.to(device=self.device)
+        for module in model.modules():
+            method = getattr(module, "quant_method", None)
+            owned = (
+                {id(p) for p in method.extra_params(module)}
+                if method is not None
+                else set()
+            )
+            for param in module.parameters(recurse=False):
+                if id(param) not in owned and param.is_floating_point():
+                    param.data = param.data.to(self.dtype)
+        return model
 
     def _probe_cg_footprint(self) -> int:
         probe_config = copy.copy(self.config)

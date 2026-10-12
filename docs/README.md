@@ -9,6 +9,7 @@
 | [parallelism.md](parallelism.md) | TP / PP / DP / EP 切分方式与 NCCL·Gloo·ZMQ 通信 |
 | [performance.md](performance.md) | 基准方法、本引擎端到端结果、与官方 vLLM 对比 |
 | [parallel-benchmark.md](parallel-benchmark.md) | 两套机器上的多卡并行实测：CUDA Graph / compile 收益、TP / PP / DP 切分选择、与官方 vLLM 对照 |
+| [fp8-debug-report.md](fp8-debug-report.md) | FP8 W8A8 落地调试：6 个缺陷的现象 / 判定依据 / 修复取舍，以及验收容差的定界过程 |
 
 ## 代码地图
 
