@@ -129,7 +129,14 @@ class Experts(nn.Module):
         self.num_experts = self.expert_end - self.expert_start
         self.intermediate_size_per_partition = divide(intermediate_size, parallel.tp_size)
         i = self.intermediate_size_per_partition
-        # 量化配置（None = 不量化；支持 fp8 与 INT4 weight-only）
+        # 量化配置（None = 不量化；支持 fp8 与 INT4 weight-only）。
+        # INT8 W8A8 不覆盖 MoE 专家：显式 raise 而非让专家层静默留在 BF16
+        # （那会让 `--quantization int8` 的显存/精度收益变成不可预期的混合路径）。
+        if quant is not None and quant.method == "int8":
+            raise NotImplementedError(
+                "INT8 W8A8 is not implemented for MoE experts; use fp8 / "
+                "awq / gptq for MoE models (INT8 covers dense linear layers)"
+            )
         self.quant = (
             quant if (quant is not None and quant.method in ("fp8", *_INT4)) else None
         )

@@ -289,6 +289,12 @@ class Qwen3ForCausalLM(nn.Module):
         catcher = Fp8FallbackCatcher(params)
 
         for name, w in weights:
+            # 0. SmoothQuant 的静态激活 scale：不支持（其权重已按校准统计量
+            # 预缩放，与动态 per-token 激活量化不兼容）
+            if name.endswith(".input_scale"):
+                from src.quant.methods.int8 import Int8Method
+
+                raise Int8Method._reject_input_scale()
             # 1. PP 层索引过滤和重映射
             layer_idx = _parse_layer_idx(name)
             if layer_idx is not None:
