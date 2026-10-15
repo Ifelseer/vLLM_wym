@@ -167,20 +167,34 @@ class Qwen3MoeForCausalLM(Qwen3ForCausalLM):
         coverage: dict[str, set[tuple[int, str]]],
     ) -> bool:
         m = re.search(
-            r"(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight(_scale)?$",
+            r"(.*\.mlp\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)"
+            r"\.(weight|weight_scale|qweight|scales|qzeros)$",
             name,
         )
         if not m:
             return False
-        prefix, expert_id_s, proj = m.group(1), m.group(2), m.group(3)
-        is_scale = m.group(4) is not None
+        prefix, expert_id_s, proj, field = (
+            m.group(1),
+            m.group(2),
+            m.group(3),
+            m.group(4),
+        )
         expert_id = int(expert_id_s)
         experts = self._experts_module(name)
         if experts is None:
             return True
         if experts._local_id(expert_id) is None:
             return True
-        if is_scale:
+        int4 = getattr(experts, "int4", False)
+        if int4:
+            # INT4（AWQ/GPTQ）：三件套各自归一化后写入 packed 参数
+            experts.weight_loader_int4(
+                loaded_weight, f"{proj}.weight", expert_id, field
+            )
+            param = "w13" if proj in ("gate_proj", "up_proj") else "w2"
+            loaded.add(f"{prefix}.{param}_{field}")
+            return True
+        if field == "weight_scale":
             # FP8 预量化 checkpoint 的 per-expert block scale
             if getattr(experts, "quant", None) is None:
                 return True

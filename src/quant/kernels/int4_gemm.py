@@ -217,6 +217,20 @@ def qweight_to_in_major(
     ]
     if method == "gptq":
         cands = [cands[2], cands[0], cands[1]]
+    # 形状歧义：in == out 时 in_major 与 out_major 形状相同（如 o_proj 这类
+    # 方形层）。此时按 in-major 处理（vLLM awq 内核对 AutoAWQ checkpoint
+    # 的约定，证据最强），并告警提示可核查。
+    seen: set[tuple[int, ...]] = set()
+    for _, shape in cands:
+        if shape in seen and qw.shape == shape:
+            print(
+                f"[WARN] INT4 qweight layout ambiguous (in==out=={in_full}); "
+                "assuming in-major [in, out/8] (AWQ convention). If the "
+                "checkpoint was produced by an out-major packer, values will "
+                "be scrambled - verify against a reference output."
+            )
+            break
+        seen.add(shape)
     for layout, shape in cands:
         if qw.shape != shape:
             continue

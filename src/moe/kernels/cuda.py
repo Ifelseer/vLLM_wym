@@ -127,7 +127,9 @@ def moe_sum(mid: torch.Tensor, M: int, top_k: int) -> torch.Tensor:
     if mid.is_cuda and cuda_available():
         _ext().moe_sum(mid.view(M, top_k, H), out)
         return out
-    return mid.view(M, top_k, H).sum(dim=1, out=out)
+    # CPU 回退：不用 ``sum(dim=1, out=out)``——该签名在较新 torch 已移除
+    out.copy_(mid.view(M, top_k, H).sum(dim=1))
+    return out
 
 
 def moe_align_block_size(

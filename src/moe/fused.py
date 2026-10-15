@@ -84,7 +84,26 @@ def fused_moe_forward(
     w2_weight: torch.Tensor,
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
+    w13_zeros: torch.Tensor | None = None,
+    w2_zeros: torch.Tensor | None = None,
+    int4: bool = False,
+    zero_bias: float = 0.0,
 ) -> torch.Tensor:
+    if int4:
+        # INT4 weight-only：Triton grouped GEMM（packed int32 + per-group scale/zeros）
+        return triton_moe.forward(
+            hidden_states=hidden_states,
+            topk_ids=topk_ids,
+            topk_weights=topk_weights,
+            w13_weight=w13_weight,
+            w2_weight=w2_weight,
+            w13_scale=w13_scale,
+            w2_scale=w2_scale,
+            w13_zeros=w13_zeros,
+            w2_zeros=w2_zeros,
+            int4=True,
+            zero_bias=zero_bias,
+        )
     quantized = w13_scale is not None
     if quantized:
         # FP8 block-scale：cutlass 仅 SM90 支持 block scale → 统一 Triton

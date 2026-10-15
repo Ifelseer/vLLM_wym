@@ -10,6 +10,15 @@ FP8 量化（``quant.method == "fp8"``）时：
   （gate/up 各自成块，无需全量 staging）。
 - 前向走 Triton grouped GEMM（block scale 版，见 kernels/triton.py）；
   cutlass 后端的 block-scale FP8 仅 SM90 支持，SM89 上强制 Triton。
+
+INT4 weight-only（``quant.method in ("awq", "gptq")``）时，内部统一
+**in-major** 布局（与 dense 侧 ``quant/kernels/int4_gemm.py`` 同约定）：
+- ``w13_qweight`` [E_local, h, 2i_local/8] int32（in=h，out=2i，[up; gate] 序）
+- ``w13_scales`` [E_local, h/G, 2i_local] fp16；``w13_zeros`` uint8（asym）
+- ``w2_qweight`` [E_local, i_local, h/8]（in=i，out=h）
+- ``w2_scales`` [E_local, i_local/G, h]；``w2_zeros`` uint8（asym）
+加载期把 AWQ/GPTQ checkpoint 归一化到该布局（解包/交织还原/转置），
+kernel 内按 k-block 解包 + scale 校正，激活保持 bf16。
 """
 
 from __future__ import annotations
@@ -19,10 +28,18 @@ from torch import nn
 
 from ..distributed import divide, ensure_divisibility
 from ..quant.kernels.fp8_gemm import FP8_DTYPE, quantize_fp8_per_block
+from ..quant.kernels.int4_gemm import (
+    INT4_SYM_BIAS,
+    qweight_to_in_major,
+    qzeros_to_in_major,
+    scales_to_in_major,
+    unpack_int4_packed_cols,
+)
 from .fused import fused_moe_forward
 from .parallel import MoEParallelConfig
 
 _SCALE = 128
+_INT4 = ("awq", "gptq")
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -112,16 +129,66 @@ class Experts(nn.Module):
         self.num_experts = self.expert_end - self.expert_start
         self.intermediate_size_per_partition = divide(intermediate_size, parallel.tp_size)
         i = self.intermediate_size_per_partition
-        # FP8 量化配置（None = 不量化）
-        self.quant = quant if (quant is not None and quant.method == "fp8") else None
-        if self.quant is not None:
+        # 量化配置（None = 不量化；支持 fp8 与 INT4 weight-only）
+        self.quant = (
+            quant if (quant is not None and quant.method in ("fp8", *_INT4)) else None
+        )
+        self.int4 = quant is not None and quant.method in _INT4
+        if self.int4:
+            g = int(quant.group_size)
+            ensure_divisibility(i, g)
+            ensure_divisibility(hidden_size, g)
+            self.group_size = g
+            asym = (quant.method == "awq") or (not quant.sym)
+            self.int4_asym = asym
+            # GPTQ sym（uint4b8）：存储值 = 量化值 + 8，无 qzeros 张量
+            self.zero_bias = 0.0 if asym else INT4_SYM_BIAS
+            # w13：in=h（量化组沿 h），out=2i（[up; gate] 序，本地）
+            # 注意 requires_grad=False：int32/uint8/fp8 不能 requires_grad；
+            # zeros 初始化：EP 过滤/覆盖断言才有确定语义（empty 是未定义内存）
+            self.w13_qweight = nn.Parameter(
+                torch.zeros(self.num_experts, hidden_size, (2 * i) // 8, dtype=torch.int32),
+                requires_grad=False,
+            )
+            self.w13_scales = nn.Parameter(
+                torch.zeros(self.num_experts, hidden_size // g, 2 * i, dtype=torch.float16),
+                requires_grad=False,
+            )
+            if asym:
+                self.w13_zeros = nn.Parameter(
+                    torch.zeros(self.num_experts, hidden_size // g, 2 * i, dtype=torch.uint8),
+                    requires_grad=False,
+                )
+            else:
+                self.register_parameter("w13_zeros", None)
+            # w2：in=i（量化组沿 i），out=h
+            self.w2_qweight = nn.Parameter(
+                torch.zeros(self.num_experts, i, hidden_size // 8, dtype=torch.int32),
+                requires_grad=False,
+            )
+            self.w2_scales = nn.Parameter(
+                torch.zeros(self.num_experts, i // g, hidden_size, dtype=torch.float16),
+                requires_grad=False,
+            )
+            if asym:
+                self.w2_zeros = nn.Parameter(
+                    torch.zeros(self.num_experts, i // g, hidden_size, dtype=torch.uint8),
+                    requires_grad=False,
+                )
+            else:
+                self.register_parameter("w2_zeros", None)
+            setattr(self.w13_qweight, "weight_loader", self.weight_loader_w13)
+            setattr(self.w2_qweight, "weight_loader", self.weight_loader_w2)
+        elif self.quant is not None:
             ensure_divisibility(i, _SCALE)
             ensure_divisibility(hidden_size, _SCALE)
             self.w13_weight = nn.Parameter(
-                torch.empty(self.num_experts, 2 * i, hidden_size, dtype=FP8_DTYPE)
+                torch.empty(self.num_experts, 2 * i, hidden_size, dtype=FP8_DTYPE),
+                requires_grad=False,
             )
             self.w2_weight = nn.Parameter(
-                torch.empty(self.num_experts, hidden_size, i, dtype=FP8_DTYPE)
+                torch.empty(self.num_experts, hidden_size, i, dtype=FP8_DTYPE),
+                requires_grad=False,
             )
             self.register_buffer(
                 "w13_scale",
@@ -148,8 +215,8 @@ class Experts(nn.Module):
                 torch.empty(self.num_experts, 2 * i, hidden_size)
             )
             self.w2_weight = nn.Parameter(torch.empty(self.num_experts, hidden_size, i))
-        setattr(self.w13_weight, "weight_loader", self.weight_loader_w13)
-        setattr(self.w2_weight, "weight_loader", self.weight_loader_w2)
+            setattr(self.w13_weight, "weight_loader", self.weight_loader_w13)
+            setattr(self.w2_weight, "weight_loader", self.weight_loader_w2)
         self.register_buffer(
             "expert_map",
             make_expert_map(
@@ -286,6 +353,100 @@ class Experts(nn.Module):
         ].copy_(src[:, self.tp_rank * local_gi : (self.tp_rank + 1) * local_gi])
 
     # ------------------------------------------------------------------ #
+    # INT4 weight-only（AWQ / GPTQ）per-expert 加载
+    # ------------------------------------------------------------------ #
+
+    def _int4_param(self, field: str, which: str):
+        # checkpoint 字段名 → 参数名：qzeros → zeros（qweight/scales 同名）
+        suffix = "zeros" if field == "qzeros" else field
+        return getattr(self, f"{which}_{suffix}")
+
+    def weight_loader_int4(
+        self,
+        loaded_weight: torch.Tensor,
+        weight_name: str,
+        expert_id: int,
+        field: str,
+    ) -> None:
+        """把 AWQ/GPTQ 的 per-expert 张量归一化并写入 INT4 参数。
+
+        Args:
+            weight_name: ``"gate_proj.weight"`` / ``"up_proj.weight"`` /
+                ``"down_proj.weight"``（与 FP8 路径同口径，用于定位段）。
+            field: ``"qweight"`` / ``"scales"`` / ``"qzeros"``。
+        """
+        local = self._local_id(expert_id)
+        if local is None:
+            return
+        i = self.intermediate_size_per_partition
+        is_w13 = weight_name in ("gate_proj.weight", "up_proj.weight")
+        in_full, out_full = (
+            (self.hidden_size, self.intermediate_size)
+            if is_w13
+            else (self.intermediate_size, self.hidden_size)
+        )
+        # 1) 归一化到内部 in-major（方向/交织/打包轴在此一次性处理）
+        if field == "qweight":
+            norm = qweight_to_in_major(
+                loaded_weight,
+                in_full=in_full,
+                out_full=out_full,
+                method=self.quant.method,
+            )  # [in, out/8] int32
+        elif field == "scales":
+            norm = scales_to_in_major(
+                loaded_weight,
+                in_full=in_full,
+                out_full=out_full,
+                group_size=self.group_size,
+            )  # [in/G, out] fp32
+        else:
+            packed = qzeros_to_in_major(
+                loaded_weight,
+                in_full=in_full,
+                out_full=out_full,
+                group_size=self.group_size,
+            )
+            norm = unpack_int4_packed_cols(packed, out_full)  # [in/G, out] uint8
+
+        # 2) TP 切分 + 写入
+        if is_w13:
+            # out=2i（[up | gate] 序）按 TP 切；qweight 的列是打包列（out/8）
+            seg_out = 0 if weight_name == "up_proj.weight" else i
+            if field == "qweight":
+                c0 = seg_out // 8
+                cl = i // 8
+                src = norm[
+                    :, self.tp_rank * cl : (self.tp_rank + 1) * cl
+                ]  # [h, i/8]
+                self.w13_qweight.data[local, :, c0 : c0 + cl].copy_(src)
+            else:
+                src = norm[:, self.tp_rank * i : (self.tp_rank + 1) * i]  # [h/G, i]
+                p = self._int4_param(field, "w13")
+                p.data[local, :, seg_out : seg_out + i].copy_(src.to(p.dtype))
+        else:
+            # down：in=i 按 TP 切（量化组维随之切；i 整除 G）
+            g_local = i // self.group_size
+            if field == "qweight":
+                src = norm[self.tp_rank * i : (self.tp_rank + 1) * i]  # [i, h/8]
+                self.w2_qweight.data[local].copy_(src)
+            else:
+                src = norm[self.tp_rank * g_local : (self.tp_rank + 1) * g_local]
+                p = self._int4_param(field, "w2")
+                p.data[local].copy_(src.to(p.dtype))
+
+    def int4_payload(self) -> dict:
+        """INT4 前向所需的权重/scale/zeros 组（供 fused_moe_forward 透传）。"""
+        return {
+            "w13_qweight": self.w13_qweight,
+            "w2_qweight": self.w2_qweight,
+            "w13_scales": self.w13_scales,
+            "w2_scales": self.w2_scales,
+            "w13_zeros": self.w13_zeros,
+            "w2_zeros": self.w2_zeros,
+        }
+
+    # ------------------------------------------------------------------ #
     # 融合专家张量加载（vLLM/SGLang 风格 3D）
     # ------------------------------------------------------------------ #
 
@@ -355,6 +516,21 @@ class Experts(nn.Module):
         if not hidden_states.is_cuda:
             raise RuntimeError("MoE fused kernels require CUDA tensors")
         mapping = self.expert_map.to(device=topk_ids.device, non_blocking=True)
+        if self.int4:
+            return fused_moe_forward(
+                backend=self.fused_backend,
+                hidden_states=hidden_states,
+                topk_ids=mapping[topk_ids.long()],
+                topk_weights=topk_weights,
+                w13_weight=self.w13_qweight,
+                w2_weight=self.w2_qweight,
+                w13_scale=self.w13_scales,
+                w2_scale=self.w2_scales,
+                w13_zeros=self.w13_zeros,
+                w2_zeros=self.w2_zeros,
+                int4=True,
+                zero_bias=self.zero_bias,
+            )
         return fused_moe_forward(
             backend=self.fused_backend,
             hidden_states=hidden_states,
