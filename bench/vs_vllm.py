@@ -76,6 +76,8 @@ def _ours(
     tp: int,
     enable_ep: bool,
     moe_backend: str,
+    quantization: str = "none",
+    quant_kv_cache: bool = False,
 ) -> dict:
     eng = Engine(
         EngineConfig(
@@ -83,6 +85,8 @@ def _ours(
             device_ids=devices[:tp],
             tp_size=tp,
             enable_ep=enable_ep,
+            quantization=quantization,  # type: ignore[arg-type]
+            quant_kv_cache=quant_kv_cache,
             enforce_eager=True,
             max_num_seqs=1,
             context_len=2048,
@@ -176,6 +180,13 @@ def main() -> None:
     p.add_argument("--prompt", default="The capital of France is")
     p.add_argument("--moe-backend", default="triton")
     p.add_argument(
+        "--quantization",
+        default="none",
+        choices=("none", "fp8", "int8", "auto"),
+        help="vLLM_wym 侧量化方式；与官方 vLLM 对比时请用预量化 checkpoint",
+    )
+    p.add_argument("--quant-kv-cache", action="store_true", help="vLLM_wym 侧 FP8 KV")
+    p.add_argument(
         "--vllm-python",
         default="",
         help="Python with official `vllm` installed (separate venv recommended)",
@@ -188,7 +199,7 @@ def main() -> None:
     if not Path(model).is_dir():
         raise SystemExit(f"missing model: {model}")
 
-    print(f"== vLLM_wym ({args.model}) ==")
+    print(f"== vLLM_wym ({args.model}, quant={args.quantization}) ==")
     ours = _ours(
         model,
         args.prompt,
@@ -199,6 +210,8 @@ def main() -> None:
         tp=args.tp,
         enable_ep=bool(args.ep),
         moe_backend=args.moe_backend,
+        quantization=args.quantization,
+        quant_kv_cache=args.quant_kv_cache,
     )
     print(json.dumps(ours, ensure_ascii=False))
 

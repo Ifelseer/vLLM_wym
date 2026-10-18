@@ -12,6 +12,20 @@
 
 依赖方向：``compute/*`` 与 ``moe/*`` 可依赖本模块；本模块只依赖 ``torch``
 与 ``src/config.py`` 的类型，不反向依赖 compute 具体实现。
+
+DSpark（投机解码）预留扩展点（本轮不实现，详见 ``docs/quantization.md`` §8）：
+
+- **draft 与 target 可用不同量化档位**。``get_quant_method(prefix=...)`` 已按
+  层前缀过滤（``modules_to_not_convert``），draft 层前缀接入同一注册表即可，
+  无需改动本模块结构；``QuantMethod.forward`` 与 TP 通信解耦，可直接复用。
+- **KV 共享**：FP8 KV 的 per-layer 固定 scale 对 draft/target 共用同一 KV 池
+  是兼容的（同层同 scale）；独立 KV 池时按层偏移扩展
+  ``src/compute/fp8_kv.py::Fp8KVManager._kv_slice``。
+- **多 token verify**：三个 kernel 均接受任意 M（含 CUDA Graph 分档 tile），
+  draft 的多 token 并行 verify 只需传更大的 M；注意 INT8 在 M=16 处的双路径
+  切换点（Triton 小 M ↔ ``torch._int_mm``）需实测覆盖。
+- **调度双序列**：挂载点是 ``src/control/scheduler.py::Scheduler.schedule`` 的
+  ``waiting`` / ``running`` 队列（不在本模块内，故仅在此标注）。
 """
 
 from __future__ import annotations

@@ -46,6 +46,7 @@ def handle_hub_cli(args: Any) -> bool:
     from utils.model_hub import (
         DEFAULT_CACHE_DIR,
         QWEN3_REGISTRY,
+        QUANT_REGISTRY,
         download_models,
         gpu_memory_gb,
         select_models_for_vram,
@@ -55,9 +56,25 @@ def handle_hub_cli(args: Any) -> bool:
         vram = gpu_memory_gb() or 24.0
         selected = select_models_for_vram(vram_gb=vram)
         print(f"Cache: {DEFAULT_CACHE_DIR}")
-        print(f"VRAM:  {vram:.1f} GB")
-        print(f"All:   {', '.join(s.local_name for s in QWEN3_REGISTRY)}")
-        print(f"Fit:   {', '.join(s.local_name for s in selected)}")
+        print(f"VRAM:  {vram:.1f} GB（预算预留 4.0 GB）")
+        print(f"BF16:  {', '.join(f'{s.local_name}({s.size_gb:.1f}G)' for s in QWEN3_REGISTRY)}")
+        print(
+            "Quant: "
+            + ", ".join(
+                f"{s.local_name}({s.quant}, {s.size_gb:.1f}G)" for s in QUANT_REGISTRY
+            )
+        )
+        print(
+            "Fit:   "
+            + ", ".join(
+                s.local_name if s.quant == "none" else f"{s.local_name}[{s.quant}]"
+                for s in selected
+            )
+        )
+        print(
+            "提示：预量化 checkpoint 需按 repo_id 单独下载"
+            "（如 hf download Qwen/Qwen3-32B-AWQ --local-dir ~/huggingface/Qwen3-32B-AWQ）"
+        )
         return True
 
     print(f"Downloading to {DEFAULT_CACHE_DIR} ...")
