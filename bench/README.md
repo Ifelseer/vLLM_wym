@@ -48,6 +48,10 @@ PYTHONPATH=. python bench/moe_e2e.py --devices 0,1 --tp 2 --ep --eager
 PYTHONPATH=. python bench/quant_bench.py --model ~/huggingface/Qwen3-0.6B \
     --quantizations none,fp8,int8 --cg --n 64 --json quant.json
 
+# batch-8：8 路并发，decode/e2e 为聚合吞吐（对齐并行报告的 batch8 口径）
+PYTHONPATH=. python bench/quant_bench.py --model ~/huggingface/Qwen3-8B \
+    --quantizations none,fp8,int8 --cg --batch 8 --n 128 --json quant8b.json
+
 # 预量化 checkpoint：与 BF16 兄弟模型对比
 PYTHONPATH=. python bench/quant_bench.py --model ~/huggingface/Qwen3-0.6B \
     --quantized-model ~/huggingface/Qwen3-0.6B-FP8 --cg

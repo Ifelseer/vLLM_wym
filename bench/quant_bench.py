@@ -56,6 +56,7 @@ def _run_one(
     moe_backend: str,
     quant_kv_cache: bool,
     cg: bool,
+    batch: int = 1,
 ) -> dict:
     import torch
 
@@ -68,7 +69,7 @@ def _run_one(
             quantization=quantization,  # type: ignore[arg-type]
             quant_kv_cache=quant_kv_cache,
             enforce_eager=not cg,
-            max_num_seqs=1,
+            max_num_seqs=max(batch, 1),
             context_len=2048,
             num_kvcache_blocks=64,
             gpu_memory_utilization=0.85,
@@ -79,39 +80,42 @@ def _run_one(
     try:
         sp_w = SamplingParams(temperature=0.0, max_tokens=4, ignore_eos=True)
         for _ in range(warmup):
-            seq = eng.add_request(prompt, sp_w)
-            while not seq.is_finished:
+            warm_seqs = [eng.add_request(prompt, sp_w) for _ in range(batch)]
+            while eng.has_unfinished():
                 eng.step()
+            del warm_seqs
 
         e2es, ttfts, last = [], [], []
         sp = SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
         for _ in range(reps):
-            seq = eng.add_request(prompt, sp)
+            torch.cuda.reset_peak_memory_stats()
+            seqs = [eng.add_request(prompt, sp) for _ in range(batch)]
             t0 = time.perf_counter()
             first = None
-            while not seq.is_finished:
+            while eng.has_unfinished():
                 eng.step()
-                if first is None and seq.num_completion_tokens >= 1:
+                if first is None and any(s.num_completion_tokens >= 1 for s in seqs):
                     first = time.perf_counter()
             t1 = time.perf_counter()
             e2es.append(t1 - t0)
             ttfts.append((first - t0) * 1e3 if first else float("nan"))
-            last = list(seq.token_ids[seq.num_prompt_tokens :])
+            last = list(seqs[0].token_ids[seqs[0].num_prompt_tokens :])
+            del seqs
 
-        torch.cuda.reset_peak_memory_stats()
-        seq = eng.add_request(prompt, sp)
-        while not seq.is_finished:
-            eng.step()
         peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
 
         e2e = statistics.mean(e2es)
         ttft = statistics.mean(ttfts)
         decode_s = max(e2e - ttft / 1e3, 1e-6)
+        # batch 口径：decode 统计首 token 之后的全部生成 token
+        total = batch * n
+        after_first = batch * max(n - 1, 0)
         return {
             "quant": quantization,
+            "batch": batch,
             "ttft_ms": ttft,
-            "decode_tok_s": (n - 1) / decode_s if n > 1 else float("nan"),
-            "e2e_tok_s": n / e2e,
+            "decode_tok_s": after_first / decode_s if after_first else float("nan"),
+            "e2e_tok_s": total / e2e,
             "peak_mem_gb": peak_gb,
             "tokens": last,
         }
@@ -148,6 +152,12 @@ def main() -> None:
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--ep", action="store_true")
     p.add_argument("--n", type=int, default=64)
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=1,
+        help="并发请求数（batch-8 用 8）；TTFT 为首个 token，decode/e2e 为聚合吞吐",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--prompt", default="The capital of France is")
@@ -183,6 +193,7 @@ def main() -> None:
                     moe_backend=args.moe_backend,
                     quant_kv_cache=args.quant_kv_cache,
                     cg=args.cg,
+                    batch=args.batch,
                 )
             )
     else:
@@ -204,6 +215,7 @@ def main() -> None:
                     moe_backend=args.moe_backend,
                     quant_kv_cache=args.quant_kv_cache,
                     cg=args.cg,
+                    batch=args.batch,
                 )
             )
 
@@ -223,7 +235,8 @@ def main() -> None:
             f"{r['e2e_tok_s']:>12.1f}{r['peak_mem_gb']:>10.2f}"
             f"{mem_ratio:>11.2f}x{match:>12.1%}"
         )
-    print("\n口径：temperature=0 贪心；token match = 与首行（基线）逐 token 一致率")
+    print(f"\n口径：temperature=0 贪心；batch={args.batch}；"
+          "token match = 与首行（基线）逐 token 一致率")
     print("     TTFT 从 add_request 到首个 completion token；peak 为引擎生命周期峰值")
 
     if args.json:
@@ -233,6 +246,7 @@ def main() -> None:
                     "model": args.model,
                     "prompt": args.prompt,
                     "n": args.n,
+                    "batch": args.batch,
                     "reps": args.reps,
                     "cg": args.cg,
                     "results": [

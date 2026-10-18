@@ -109,7 +109,7 @@ tests/
 │   ├── test_quant_kv.py           # FP8 KV decode/prefill/roundtrip vs FA2（SM89+）
 │   ├── test_quant_int4.py         # dense + MoE 数值（任意 SM；本地 3060 实跑）
 │   ├── test_quant_int8.py         # W8A8 数值 + 吞吐微基准（任意 SM61+）
-│   └── test_quant_e2e.py          # 贪心一致率 gate（≥99%）+ CG 路径
+│   └── test_quant_e2e.py          # teacher-forced top-1/logit gate + eager/CG 一致性
 └── distributed/
     └── test_quant_parallel.py     # tp1/tp2/tp2+ep 贪心一致 + 跨格式一致率
 ```
@@ -119,7 +119,7 @@ tests/
 | 层级 | 判据 |
 |---|---|
 | kernel 数值 | rel = max\|Δ\|/max\|ref\|；FP8 dense <0.08、MoE <0.12；INT4 dense <0.02、MoE <0.25；INT8 <0.02 |
-| 端到端 | greedy token 一致率 ≥99%（int4 允许 ≥95%）；多卡与单卡逐 token 一致 |
+| 端到端 | **teacher-forced**：相同上下文下 top-1 一致率 ≥95%（仅计 BF16 margin ≥0.5 的决定性位置），top-1 logit 最大偏差 ≤1.5；同档位 eager vs CG 逐 token 完全一致。自由生成的"逐 token 一致率 ≥99%"不可达——近似并列处量化噪声会翻转 argmax 并级联（详见 `test_quant_e2e.py` 文档） |
 | 吞吐 | 同 prompt 的 TTFT / decode tok/s / e2e；**CG replay 口径**（匹配部署形态，见 §7） |
 
 阈值不是调出来的：先建「理想实现」参照系（同粒度、同 scale 语义、朴素算子），

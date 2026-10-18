@@ -480,10 +480,10 @@ class Experts(nn.Module):
             return
         loaded = loaded.float()
         e, gr, hc = loaded.shape
-        # HF 段序 [gate; up] → cutlass [up; gate]
+        # HF 段序 [gate; up] → cutlass [up; gate]（与 load_fused_w13 的权重重排一致）
         gate_go = _cdiv(self.intermediate_size, _SCALE)
-        up = loaded[:, :gate_go, :]
-        gate = loaded[:, gate_go:, :]
+        gate = loaded[:, :gate_go, :]
+        up = loaded[:, gate_go:, :]
         reordered = torch.cat([up, gate], dim=1)[self.expert_start : self.expert_end]
         shard = self.intermediate_size_per_partition
         local_go = _cdiv(shard, _SCALE)

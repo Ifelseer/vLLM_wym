@@ -11,6 +11,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from tests.conftest import needs_cuda
@@ -110,7 +112,12 @@ dec.plan(
     indptr, indices, last_len, H, nkv, hd, PAGE,
     q_data_type=dtype, kv_data_type=FP8, o_data_type=dtype,
 )
-got = dec.run(q, (pool_fp8[0, 0], pool_fp8[1, 0]), k_scale=k_scale, v_scale=v_scale)
+# FlashInfer wrapper 的 scale 形参要求 Python float（内部参与 sm_scale 乘法）；
+# Tensor 仅用于 store_kvcache_fp8 的 GPU 写入内核。
+got = dec.run(
+    q, (pool_fp8[0, 0], pool_fp8[1, 0]),
+    k_scale=float(k_scale.item()), v_scale=float(v_scale.item()),
+)
 e = rel(got, ref)
 assert got.shape == ref.shape, (got.shape, ref.shape)
 assert e < 0.08, f"fp8 kv decode rel={e:.4f}"
@@ -178,7 +185,7 @@ pre.plan(
 )
 got_p = pre.run(
     q_p, (pool_fp8_p[0, 0], pool_fp8_p[1, 0]),
-    k_scale=scale_p.reshape(()), v_scale=scale_p.reshape(()),
+    k_scale=float(scale_p.item()), v_scale=float(scale_p.item()),
 )
 e_p = rel(got_p, ref_p)
 assert got_p.shape == ref_p.shape, (got_p.shape, ref_p.shape)
@@ -199,7 +206,8 @@ store_kvcache_fp8(
     pool_rt[0, 0].reshape(-1, nkv, hd), pool_rt[1, 0].reshape(-1, nkv, hd),
     slot_rt, scale_rt.reshape(()), scale_rt.reshape(()),
 )
-k_back = pool_rt[0, 0].reshape(-1, nkv, hd).float() * scale_rt
+# slot_rt 只覆盖前 512 个槽（pool 共 4×256=1024）；其余槽未写入，不参与比较
+k_back = pool_rt[0, 0].reshape(-1, nkv, hd)[:512].float() * scale_rt
 e_rt = rel(k_back, k_rt.float())
 assert e_rt < 0.08, f"fp8 kv roundtrip rel={e_rt:.4f}"
 print(f"fp8 kv roundtrip   rel={e_rt:.4f}")
@@ -215,3 +223,59 @@ def test_fp8_kv_cache_on_sm89():
     if "SKIP" in out:
         pytest.skip(out.strip().splitlines()[-1])
     assert "ALL FP8 KV TESTS PASSED" in out
+
+
+# ------------------------------------------------------------------ #
+# 引擎级通路：kernel 级测试不经过 attention.py / ModelRunner / CG，
+# 这里跑一遍真实引擎，覆盖 scale 校准、plan、录图与 decode。
+# ------------------------------------------------------------------ #
+_ENGINE_WORKER = r"""
+import json
+import sys
+
+import torch
+
+from tests.helpers.engine import cfg, engine_session
+from tests.helpers.paths import DENSE_MODEL
+from src import SamplingParams
+
+eager, port = sys.argv[1] == "1", int(sys.argv[2])
+major, minor = torch.cuda.get_device_capability(0)
+if (major, minor) < (8, 9):
+    print(f"SKIP fp8 kv requires SM89+ (got SM{major}{minor})")
+    raise SystemExit(0)
+
+config = cfg(
+    DENSE_MODEL, device_ids=[0], quantization="fp8", quant_kv_cache=True,
+    max_num_seqs=1, context_len=512, num_kvcache_blocks=16,
+    nccl_port=port, enforce_eager=eager,
+)
+with engine_session(config) as eng:
+    seq = eng.add_request(
+        eng.tokenizer.encode("The capital of France is"),
+        SamplingParams(temperature=0.0, max_tokens=8, ignore_eos=True),
+    )
+    while not seq.is_finished:
+        eng.step()
+    print(json.dumps({"tokens": list(seq.token_ids[seq.num_prompt_tokens:])}))
+"""
+
+
+def test_fp8_kv_engine_sm89():
+    """引擎级 FP8 KV：eager 与 CUDA Graph 的贪心序列必须完全一致。"""
+    gpus = pick_gpus(1, min_free_mib=4000)
+    eager = run_isolated(gpus, _ENGINE_WORKER, "1", "29671", timeout=900)
+    if "SKIP" in eager:
+        pytest.skip(eager.strip().splitlines()[-1])
+    cg = run_isolated(gpus, _ENGINE_WORKER, "0", "29672", timeout=900)
+    if "SKIP" in cg:
+        pytest.skip(cg.strip().splitlines()[-1])
+
+    def _tokens(out: str) -> list[int]:
+        lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
+        assert lines, out
+        return json.loads(lines[-1])["tokens"]
+
+    te, tc = _tokens(eager), _tokens(cg)
+    assert len(te) == 8, f"eager produced {len(te)} tokens: {te}"
+    assert te == tc, f"fp8 kv eager vs CG mismatch\n{eager=}\n{tc=}"

@@ -91,6 +91,7 @@ class Fp8KVManager:
         max_batch_size: int,
         max_blocks_per_seq: int,
         device: torch.device,
+        dtype: torch.dtype = torch.bfloat16,
         use_cuda_graph: bool,
     ) -> None:
         from flashinfer import (
@@ -104,6 +105,7 @@ class Fp8KVManager:
         self.head_dim = head_dim
         self.page_size = page_size
         self.max_batch_size = max_batch_size
+        self.dtype = dtype
         self.use_cuda_graph = use_cuda_graph
         self.capturing = False  # 录图中跳过 plan
 
@@ -131,9 +133,15 @@ class Fp8KVManager:
         self._last_len = torch.empty(
             max_batch_size, dtype=torch.int32, device=device
         )
-        # per-layer 固定 scale（0-dim；校准后冻结）
+        # per-layer 固定 scale（0-dim；校准后冻结）。两套表示：
+        # - Tensor：store_kvcache_fp8 在 GPU 内核里读；
+        # - Python float：FlashInfer wrapper 的 k_scale/v_scale 形参要求标量
+        #   （内部 ``sm_scale *= k_scale`` 后按 float 下发 kernel，传 Tensor
+        #   会被 TIR 拒绝），且 decode 热路径/录图内不能做 .item() 同步。
         self._k_scale = torch.ones(num_layers, dtype=torch.float32, device=device)
         self._v_scale = torch.ones(num_layers, dtype=torch.float32, device=device)
+        self._k_scale_val = [1.0] * num_layers
+        self._v_scale_val = [1.0] * num_layers
         self._calibrated = [False] * num_layers
         self._cg_decode_cur = None
         self._kv_cache = None
@@ -149,10 +157,19 @@ class Fp8KVManager:
         scale = (amax / _FP8_MAX * _SCALE_HEADROOM).clamp(min=_SCALE_FLOOR)
         self._k_scale[layer_id] = scale
         self._v_scale[layer_id] = scale
+        # 一次性 D2H：校准只发生在录图前的最小前向里
+        val = float(scale.item())
+        self._k_scale_val[layer_id] = val
+        self._v_scale_val[layer_id] = val
         self._calibrated[layer_id] = True
 
     def scales(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """GPU Tensor 形式（供 store_kvcache_fp8 内核读取）。"""
         return self._k_scale[layer_id], self._v_scale[layer_id]
+
+    def scales_float(self, layer_id: int) -> tuple[float, float]:
+        """Python float 形式（供 FlashInfer wrapper 的 run 使用）。"""
+        return self._k_scale_val[layer_id], self._v_scale_val[layer_id]
 
     # ------------------------------------------------------------------ #
     # plan（录图外调用）
@@ -179,18 +196,25 @@ class Fp8KVManager:
             bt, cs, self.page_size, self._indptr, self._indices, self._last_len
         )
         use_cg = self.use_cuda_graph if cg is None else cg
-        wrapper = self._cg_decode_wrapper(bs) if use_cg else self._decode_wrapper
+        if use_cg:
+            wrapper = self._cg_decode_wrapper(bs)
+            # CG wrapper 的 indices 缓冲按 bs 分配，plan 会校验源长度并拷入；
+            # 管理器缓冲是 max_bs 全长的，必须按 bs 切片。
+            indices = self._indices[: bs * self._max_blocks() + 1]
+        else:
+            wrapper = self._decode_wrapper
+            indices = self._indices
         wrapper.plan(
             self._indptr[: bs + 1],
-            self._indices,
+            indices,
             self._last_len[:bs],
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
             self.page_size,
-            q_data_type=torch.bfloat16,
+            q_data_type=self.dtype,
             kv_data_type=FP8_KV_DTYPE,
-            o_data_type=torch.bfloat16,
+            o_data_type=self.dtype,
         )
 
     def plan_prefill(
@@ -222,9 +246,9 @@ class Fp8KVManager:
             self.head_dim,
             self.page_size,
             causal=True,
-            q_data_type=torch.bfloat16,
+            q_data_type=self.dtype,
             kv_data_type=FP8_KV_DTYPE,
-            o_data_type=torch.bfloat16,
+            o_data_type=self.dtype,
         )
 
     # ------------------------------------------------------------------ #
@@ -232,8 +256,8 @@ class Fp8KVManager:
     # ------------------------------------------------------------------ #
 
     def run_decode(self, q: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """q: [bs, num_qo_heads, head_dim] bf16 → [bs, num_qo_heads, head_dim]。"""
-        k_scale, v_scale = self.scales(layer_id)
+        """q: [bs, num_qo_heads, head_dim] 激活 dtype → 同形状输出。"""
+        k_scale, v_scale = self.scales_float(layer_id)
         return self._decode_wrapper.run(
             q, self._kv_slice(layer_id), k_scale=k_scale, v_scale=v_scale
         )
@@ -241,14 +265,14 @@ class Fp8KVManager:
     def run_decode_cg(self, q: torch.Tensor, layer_id: int) -> torch.Tensor:
         """CG replay 中的 decode：用最近一次 plan 的 CG wrapper。"""
         assert self._cg_decode_cur is not None, "plan_decode() must run before replay"
-        k_scale, v_scale = self.scales(layer_id)
+        k_scale, v_scale = self.scales_float(layer_id)
         return self._cg_decode_cur.run(
             q, self._kv_slice(layer_id), k_scale=k_scale, v_scale=v_scale
         )
 
     def run_prefill(self, q: torch.Tensor, layer_id: int) -> torch.Tensor:
-        """q: [total_tokens, num_qo_heads, head_dim] bf16（有前缀缓存）。"""
-        k_scale, v_scale = self.scales(layer_id)
+        """q: [total_tokens, num_qo_heads, head_dim]（有前缀缓存）。"""
+        k_scale, v_scale = self.scales_float(layer_id)
         return self._prefill_wrapper.run(
             q, self._kv_slice(layer_id), k_scale=k_scale, v_scale=v_scale
         )

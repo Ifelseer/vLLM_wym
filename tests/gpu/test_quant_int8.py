@@ -37,6 +37,11 @@ def rel(a, b):
     return ((a.float() - b.float()).abs().max() / b.float().abs().max().clamp(min=1e-6)).item()
 
 
+def rel_mean(a, b):
+    # mean 口径：max 口径会被离群行本身主导（两种粒度在该行尺度相同）
+    return ((a.float() - b.float()).abs().mean() / b.float().abs().mean().clamp(min=1e-6)).item()
+
+
 # ---------------------------------------------------------------- #
 # 1. W8A8 GEMM vs 参考（含 decode M=1 与 prefill 大 M）
 # ---------------------------------------------------------------- #
@@ -100,12 +105,16 @@ wq, ws = quantize_per_channel(w)
 s_ts = w.abs().max().clamp(min=1e-12) / 127.0
 q_ts = (w / s_ts).round().to(torch.int8)
 
+# 两个口径陷阱：
+# 1) 参照必须是原始权重——用反量化权重作参照会把权重量化误差在两边都约掉，
+#    只剩激活量化误差，与 per-channel 粒度无关；
+# 2) 用 mean 而非 max——离群行自身的 scale 在两种粒度下相同，max|Δ| 恰好被
+#    该行主导，两种粒度会测出相同误差。
 got_pc = w8a8_int8_matmul(x, wq, ws)
-ref_ts = (quantize_per_token(x)[0].float() * quantize_per_token(x)[1]) @ (
-    q_ts.float() * s_ts
-).t()
-e_pc = rel(got_pc, x.float() @ dequantize_per_channel(wq, ws).t())
-e_ts = rel(ref_ts, x.float() @ (q_ts.float() * s_ts).t())
+got_ts = w8a8_int8_matmul(x, q_ts, s_ts.expand(N).contiguous())
+ref = x.float() @ w.t()
+e_pc = rel_mean(got_pc, ref)
+e_ts = rel_mean(got_ts, ref)
 assert e_pc < e_ts, f"per_channel={e_pc:.5f} should beat per_tensor={e_ts:.5f}"
 print(f"int8 outlier per_channel={e_pc:.5f} < per_tensor={e_ts:.5f}")
 

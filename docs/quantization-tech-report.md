@@ -23,7 +23,7 @@
 | 提升吞吐 | decode tok/s、TTFT（同 prompt 对比 BF16 基线） |
 | 扩大硬件覆盖 | INT8 覆盖无原生 FP8 的 SM86（3060） |
 | 支持 30B 级 MoE 单卡可跑 | INT4 weight-only |
-| 正确性 | greedy token 一致率 ≥ 99%（vs BF16 eager） |
+| 正确性 | teacher-forced 同上下文 top-1 一致率（决定性位置 ≥95%）+ eager/CG 逐 token 一致 |
 
 **约束**：完全复用现有技术栈（不引入 vLLM/torchao）；量化关闭时代码路径与现状完全一致（回归基线）；每个 Phase 独立提交、独立可测。
 

@@ -103,11 +103,15 @@ def quantize_per_token(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def quantize_per_channel(w: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``w[out,in]`` → (int8 [out,in], fp32 scale [out])（对称 per-channel 静态）。"""
+    """``w[out,in]`` → (int8 [out,in], fp32 scale [out])（对称 per-channel 静态）。
+
+    必须 round 而非直接 ``.to(int8)``：后者向零截断，给所有权重引入约半个 LSB
+    的系统性收缩偏置（实测离群通道场景误差 0.0176 vs round 的 0.0097）。
+    """
     amax = w.abs().amax(dim=1).clamp(min=1e-12)
     scale = amax.to(torch.float32) / _INT8_MAX
-    q = (w / scale[:, None]).to(INT8_DTYPE)
-    return q, scale
+    q = (w.float() / scale[:, None]).round().clamp_(-_INT8_MAX, _INT8_MAX)
+    return q.to(INT8_DTYPE), scale
 
 
 def dequantize_per_channel(
@@ -156,14 +160,16 @@ def _int8_gemm_small_m_kernel(
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
     for k0 in range(0, K, BLOCK_K):
+        # K 非 BLOCK_K 整数倍时块尾越出张量，load 必须与 store 一样带 K 掩码
+        k_mask = (k0 + offs_k) < K
         a = tl.load(
             a_q_ptr + offs_m[:, None] * stride_am + (k0 + offs_k)[None, :] * stride_ak,
-            mask=m_mask[:, None],
+            mask=m_mask[:, None] & k_mask[None, :],
             other=0,
         )
         w = tl.load(
             q_ptr + offs_n[None, :] * stride_qn + (k0 + offs_k)[:, None] * stride_qk,
-            mask=n_mask[None, :],
+            mask=n_mask[None, :] & k_mask[:, None],
             other=0,
         )
         acc += tl.dot(a, w, out_dtype=tl.int32)

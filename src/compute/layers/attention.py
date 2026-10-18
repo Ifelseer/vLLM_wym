@@ -83,7 +83,7 @@ def attention(
     v_cache = pool[1, layer_id]
     if meta.fp8_kv is not None:
         return _attention_fp8(
-            meta, k, v, k_cache, v_cache, slot_mapping, is_prefill,
+            meta, q, k, v, k_cache, v_cache, slot_mapping, is_prefill,
             cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
             block_tables, layer_id, num_qo_heads, num_kv_heads, head_dim,
         )
@@ -138,6 +138,7 @@ def _attention_fake(
 
 def _attention_fp8(
     meta: AttnMetadata,
+    q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
     k_cache: torch.Tensor,

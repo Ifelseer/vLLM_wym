@@ -231,8 +231,8 @@ e2e（4090）
 
 | 项 | 性质 | 处置 |
 |---|---|---|
-| FP8 KV GPU 三路对齐 + e2e（含 CG 交互） | 未验证 | 4090 清单第 1/2/3 项；CG+FP8KV 的 on_warmup plan 是全新组合 |
-| e2e greedy token 一致率（≥99%） | 未测 | 只测了吞吐没测正确性；温度 0 逐 token 比对 |
+| FP8 KV GPU 三路对齐 + e2e（含 CG 交互） | 已验证 | `test_quant_kv.py`：decode / prefill / roundtrip 三路 + 引擎级 eager/CG 一致性；修复了 FlashInfer scale 标量类型与 CG indices 缓冲长度两处问题 |
+| e2e 正确性口径 | 已修正 | 自由生成的逐 token 一致率 ≥99% 不可达（近似并列翻转会级联）；改为 teacher-forced 同上下文 top-1 / logit 比较，并单列 eager vs CG 一致性 |
 | 预量化 checkpoint 路径（`--quantization auto`） | 未测 | 只验了在线量化；Qwen3-0.6B-FP8 的 tied embed 正好覆盖 catcher 反量化 |
 | MoE + FP8 + CG | 未测 | Triton block-scale grouped GEMM 进图是全新组合 |
 | 长 prompt TTFT | 未测 | +8% 是短 prompt 口径；8K prefill 的 FP8 开销可能放大 |

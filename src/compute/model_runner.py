@@ -77,6 +77,7 @@ class ModelRunner:
                 max_batch_size=max_bs,
                 max_blocks_per_seq=max_blocks,
                 device=device,
+                dtype=kv.dtype,
                 use_cuda_graph=not config.enforce_eager,
             )
             self._fp8_kv.set_kv_cache(self.kv_cache)
