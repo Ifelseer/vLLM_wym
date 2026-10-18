@@ -252,6 +252,3 @@ e2e（4090）
 
 ---
 
-📌 作者：yinjianheng（殷健恒）｜email: yinjianheng@foxmail.com｜wechat: YJH-yinjianheng
-📄 许可：免费开源，仅供个人学习使用；未经作者书面授权禁止任何商业用途。
-🔄 本文件由活体专家系统治理：内容可溯源、可复核、可保鲜（详见 IT Skill §活体专家系统四支柱与自迭代引擎）。
