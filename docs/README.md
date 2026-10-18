@@ -12,6 +12,7 @@
 | [fp8-debug-report.md](fp8-debug-report.md) | FP8 W8A8 落地调试：6 个缺陷的现象 / 判定依据 / 修复取舍，以及验收容差的定界过程 |
 | [quantization-deep-dive.md](quantization-deep-dive.md) | 量化实现全解析：从请求到 kernel 的完整链路、五种方案的通路、优化点动机、错误复盘 |
 | [quantization-bench.md](quantization-bench.md) | 单卡 Qwen3-8B batch-8 量化基准：BF16 / FP8 / INT8 的 TTFT、吞吐、显存对比与成因分析 |
+| [profiling-and-optimization.md](profiling-and-optimization.md) | nsys 实测：autotune 陷阱、稳态构成、GEMM 并行度分析、优化 ROI 排序与面试问答 |
 
 ## 代码地图
 
