@@ -488,7 +488,12 @@ class Experts(nn.Module):
         shard = self.intermediate_size_per_partition
         local_go = _cdiv(shard, _SCALE)
         start = self.tp_rank * local_go
-        self.w13_scale.copy_(reordered[:, start : start + 2 * local_go, :])
+        # 必须像 load_fused_w13 一样**分别**取 up/gate 两段的本地分片：
+        # reordered 的行是 [up(全量) | gate(全量)]，段内窗口跨段会取到别的段
+        # （tp>1 时 rank0 会拿到 [up0, up1] 而期望 [up0, gate0]）。
+        u = reordered[:, start : start + local_go, :]
+        g = reordered[:, gate_go + start : gate_go + start + local_go, :]
+        self.w13_scale.copy_(torch.cat([u, g], dim=1))
 
     def load_fused_w2(self, loaded: torch.Tensor) -> None:
         loaded = _normalize_fused_weight(

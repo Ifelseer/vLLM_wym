@@ -45,6 +45,12 @@ from tests.helpers.paths import MOE_MODEL
 
 prompt, n, tp_s, ep_s, quant, port = sys.argv[1:7]
 n, tp, enable_ep, port = int(n), int(tp_s), ep_s == "1", int(port)
+# 硬件门控：fp8 需 SM89+（双 3090 / 双 3060 上应 skip 而非 fail）
+import torch
+major, minor = torch.cuda.get_device_capability(0)
+if quant == "fp8" and (major, minor) < (8, 9):
+    print(f"SKIP fp8 requires SM89+ (got SM{major}{minor})")
+    raise SystemExit(0)
 ok, reason = layout_ok(MOE_MODEL, tp=tp, enable_ep=enable_ep)
 if not ok:
     raise SystemExit(f"bad layout: {reason}")
@@ -70,7 +76,10 @@ print(json.dumps({"tokens": tokens}))
 """
 
 
-def _tokens(phys: list[int], *, tp: int, enable_ep: bool, quant: str, port: int):
+def _tokens(
+    phys: list[int], *, tp: int, enable_ep: bool, quant: str, port: int
+) -> list[int] | None:
+    """返回贪心 token；该档位在本机硬件上不支持时返回 None（调用方 skip）。"""
     out = run_isolated(
         phys[:tp],
         _WORKER,
@@ -82,6 +91,8 @@ def _tokens(phys: list[int], *, tp: int, enable_ep: bool, quant: str, port: int)
         str(port),
         timeout=1800,
     )
+    if "SKIP" in out:
+        return None
     lines = [ln for ln in out.splitlines() if ln.strip().startswith("{")]
     assert lines, out
     return json.loads(lines[-1])["tokens"]
@@ -100,6 +111,8 @@ def test_quant_tp_layouts_match_tp1(quant: str):
     """tp1 / tp2 / tp2+ep 的贪心结果必须与 tp1 完全一致。"""
     phys = pick_gpus(2, min_free_mib=12000)
     base = _tokens(phys, tp=1, enable_ep=False, quant=quant, port=29631)
+    if base is None:
+        pytest.skip(f"{quant} unsupported on this GPU pair")
     assert base, "empty baseline tokens"
     for tp, ep, port in ((2, False, 29632), (2, True, 29633)):
         got = _tokens(phys, tp=tp, enable_ep=ep, quant=quant, port=port)
@@ -118,11 +131,17 @@ def test_quant_formats_match_bf16_baseline():
     phys = pick_gpus(1, min_free_mib=12000)
     base = _tokens(phys, tp=1, enable_ep=False, quant="none", port=29641)
     assert base, "empty BF16 baseline"
-    for quant in ("fp8", "int8", "auto"):
-        got = _tokens(phys, tp=1, enable_ep=False, quant=quant, port=29642)
+    ran = 0
+    # 各档位用不同端口：同一端口在 TP>1 时走 TCPStore，复用会撞 TIME_WAIT
+    for quant, port in (("fp8", 29642), ("int8", 29643), ("auto", 29644)):
+        got = _tokens(phys, tp=1, enable_ep=False, quant=quant, port=port)
+        if got is None:
+            continue
         rate = _consistency(base, got)
         gate = _CONSISTENCY_GATE[quant]
         assert rate >= gate, (
             f"quant={quant}: greedy consistency {rate:.1%} < gate {gate:.0%}\n"
             f"base={base}\ngot ={got}"
         )
+        ran += 1
+    assert ran > 0, "no quantization level could run on this GPU"
