@@ -9,10 +9,9 @@
 | [parallelism.md](parallelism.md) | TP / PP / DP / EP 切分方式与 NCCL·Gloo·ZMQ 通信 |
 | [performance.md](performance.md) | 基准方法、本引擎端到端结果、与官方 vLLM 对比 |
 | [parallel-benchmark.md](parallel-benchmark.md) | 两套机器上的多卡并行实测：CUDA Graph / compile 收益、TP / PP / DP 切分选择、与官方 vLLM 对照 |
+| [quantization.md](quantization.md) | 量化参考手册：scale 模式、checkpoint 格式矩阵、硬件支持矩阵、测试矩阵与阈值依据、关键实现约定、DSpark 扩展点、已知限制 |
 | [fp8-debug-report.md](fp8-debug-report.md) | FP8 W8A8 落地调试：6 个缺陷的现象 / 判定依据 / 修复取舍，以及验收容差的定界过程 |
-| [quantization-deep-dive.md](quantization-deep-dive.md) | 量化实现全解析：从请求到 kernel 的完整链路、五种方案的通路、优化点动机、错误复盘 |
 | [quantization-bench.md](quantization-bench.md) | 单卡 Qwen3-8B batch-8 量化基准：BF16 / FP8 / INT8 的 TTFT、吞吐、显存对比与成因分析 |
-| [profiling-and-optimization.md](profiling-and-optimization.md) | nsys 实测：autotune 陷阱、稳态构成、GEMM 并行度分析、优化 ROI 排序与面试问答 |
 
 ## 代码地图
 

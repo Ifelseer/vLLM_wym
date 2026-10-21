@@ -1,8 +1,9 @@
 # 量化参考手册
 
-面向实现与运维的**参考文档**（叙述性总结见 `quantization-report.md` /
-`quantization-tech-report.md`）。检索基准日：**2026-10-12**（checkpoint 格式与
-FlashInfer/flash-attn 能力矩阵以该日为准，升级依赖后需复核）。
+面向实现与运维的**参考文档**，与 [quantization-bench.md](quantization-bench.md)
+（实测数据）、[fp8-debug-report.md](fp8-debug-report.md)（FP8 落地调试）配套阅读。
+检索基准日：**2026-10-12**（checkpoint 格式与 FlashInfer/flash-attn 能力矩阵以
+该日为准，升级依赖后需复核）。
 
 ---
 

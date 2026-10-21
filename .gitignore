@@ -43,3 +43,7 @@ tmp/
 wandb/
 outputs/
 checkpoints/
+
+# --- 本地 Agent 工作目录（含临时笔记 / 简历素材，不入库）---
+.workbuddy/
+.codebuddy/
