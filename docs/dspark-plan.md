@@ -60,6 +60,32 @@
 
 **验收**：greedy 与 baseline **逐 token 完全一致**；ngram 在重复文本上 decode ≥1.2×；`quantization=none` 且不开 spec 时性能零变化。
 
+#### Phase 1 落地记录（2026-10-25）
+
+已完成的代码（`spec_tokens=0` 时全部走原路径，零行为变化）：
+
+| 文件 | 内容 |
+|---|---|
+| `src/spec/{__init__,base,ngram,verify}.py` | `Drafter` 接口、`NgramDrafter`（后缀匹配，窗口 256）、`accept_greedy`（纯函数裁决） |
+| `src/data/sequence.py` | `draft_token_ids` / `num_accepted` / `append_tokens` |
+| `src/data/batch.py` | `SeqSchedule.draft_ids`：草稿随 wire 下发 |
+| `src/data/{block_manager,kv}.py` | `needed_append/can_append_n/may_append_n`：一步写 1+k 个位置，且对"块表已多于逻辑长度"幂等 |
+| `src/control/scheduler.py` | 草稿预算（context / token budget 双夹紧）、KV 不足时退化为普通 decode、`_update_spec_decode` 落账、`spec_stats` 观测 |
+| `src/compute/model_runner.py` | `_run_verify`：复用 prefill 因果通路一次算 `[anchor]+drafts` 的 logits；`read_samples` 增 `d_lens` |
+| `src/control/{executor,core}.py` | 采样结果三元组（含每序列 token 数），IPC 编码兼容（三个 `list[int]`） |
+| `run.py` / `src/config.py` | `--spec-tokens` / `--spec-draft`；`spec_tokens>0` 强制 `max_num_seqs==1` |
+
+三条关键约定（后续 Phase 不应打破）：
+
+1. **草稿不进 `token_ids`**：被拒草稿不污染长度/块账本/`num_completion_tokens`，只把验证通过的 token append。
+2. **先裁决再 publish**：`num_cached_tokens += 1+j` 后，用 `num_scheduled_tokens = 1+j` 临时驱动 `sync_prefix`，保证只有被有效 KV 覆盖的整块进前缀索引。
+3. **`len(token_ids) == num_cached_tokens + 1` 必须始终成立**：单测逐个场景断言（含零接受、EOS 截断、max_tokens 截断）。
+
+**已验证（CPU，24 项）**：草稿器边界（k/预算/最近匹配）、`accept_greedy` 的 off-by-one 全枚举、块账本幂等、落账不变量、`spec_tokens=0` 回归。
+**未验证**：GPU 端到端逐位一致（需 `Qwen3-0.6B` 权重，本机未下载）。测试已写好：`tests/gpu/test_spec_ngram_e2e.py`，同时断言"草稿被提出且被接受"以防空跑。
+
+**已知限制**：单序列；`_run_verify` 里 `argmax().tolist()` 是同步读回（Phase 5 再考虑搬到 GPU）；树形验证与温度采样尚未接入（Phase 2/4）。
+
 ### Phase 2 温度采样 + 拒绝采样
 
 改动：`Sampler.logprobs()`（`log_softmax`）、verify 时禁用 `argmax` 捷径、标准拒绝采样（接受 `min(1, p_t/p_d)`、拒绝时从 `max(0, p_t−p_d)` 归一化后采样、全接受则采 bonus）。

@@ -69,6 +69,12 @@ class Sequence:
     max_tokens: int = 128
     ignore_eos: bool = False
     last_token: int = 0
+    # --- 投机解码（spec decode）---
+    # 本步待验证的草稿 token（**不进入** token_ids：被拒的草稿不应污染长度/
+    # 块账本，只有验证通过的 token 才 append 进来）。
+    draft_token_ids: list[int] = field(default_factory=list)
+    # 上一步验证通过的草稿数；Scheduler.update 用它推进 num_cached_tokens。
+    num_accepted: int = 0
 
     @classmethod
     def from_prompt(
@@ -139,3 +145,10 @@ class Sequence:
     def append_token(self, token_id: int) -> None:
         self.token_ids.append(token_id)
         self.last_token = token_id
+
+    def append_tokens(self, token_ids: list[int]) -> None:
+        """投机解码：一次追加多个验证通过的 token。"""
+        if not token_ids:
+            return
+        self.token_ids.extend(token_ids)
+        self.last_token = token_ids[-1]

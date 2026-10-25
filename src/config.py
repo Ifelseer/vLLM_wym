@@ -73,6 +73,13 @@ class EngineConfig:
     # FP8 KV cache（仅 fp8 路径生效，SM89+；FA2 不支持，走 FlashInfer wrapper）
     quant_kv_cache: bool = False
 
+    # --- 投机解码（speculative decoding）---
+    # 0 = 关闭；k>0 = 每步草稿 k 个 token，一次 verify 写入 1+k 个位置。
+    # v1 要求 max_num_seqs == 1（verify 按单序列实现，见 docs/dspark-plan.md）。
+    spec_tokens: int = 0
+    # 草稿来源：ngram（无模型，Phase 1 验证替身）/ dspark（Phase 3 接入）
+    spec_draft: str = "ngram"
+
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
     quant_config: QuantConfig | None = field(init=False, default=None)
@@ -101,6 +108,20 @@ class EngineConfig:
                 f"quantization must be none|auto|fp8|int8|awq|gptq, "
                 f"got {self.quantization!r}"
             )
+        if self.spec_tokens < 0:
+            raise ValueError(f"spec_tokens must be >= 0, got {self.spec_tokens}")
+        if self.spec_tokens > 0:
+            # v1 限制：verify 是单序列路径（树形验证需要每序列一棵树 + 拼平
+            # cu_seqlens），多序列留到 v2。显式报错好过静默忽略。
+            if self.max_num_seqs != 1:
+                raise ValueError(
+                    "spec_tokens > 0 requires max_num_seqs == 1 in v1, "
+                    f"got max_num_seqs={self.max_num_seqs}"
+                )
+            if self.spec_draft not in ("ngram", "dspark"):
+                raise ValueError(
+                    f"spec_draft must be ngram|dspark, got {self.spec_draft!r}"
+                )
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.is_moe = _is_moe_config(self.hf_config)
         self.quant_config = self._resolve_quant()

@@ -62,6 +62,9 @@ class EngineCore:
             max_num_batched_tokens=self.config.max_num_batched_tokens,
             eos_token_id=self.eos_token_id,
             mix_prefill_decode=self.config.mix_prefill_decode,
+            spec_tokens=self.config.spec_tokens,
+            spec_draft=self.config.spec_draft,
+            max_seq_len=self.config.context_len,
         )
 
     def _init_kv(self) -> None:
@@ -126,17 +129,18 @@ class EngineCore:
 
         # 本步处理的 token 数：
         #   prefill 按实际调度的 token 数计（可能命中前缀缓存后少于原始长度）
-        #   decode 每个请求只算 1 个 token
+        #   decode 按写入位置数计（普通 decode 为 1；投机 verify 为 1+k）
         prefill_toks = sum(s.num_scheduled_tokens for s in sched.prefills)
-        metric = prefill_toks + len(sched.decodes)
+        decode_toks = sum(s.num_scheduled_tokens for s in sched.decodes)
+        metric = prefill_toks + decode_toks
 
         # ---- 采样与后处理 ----
         # 从执行器读回采样结果（prefill 和 decode 分开返回）。
-        p_ids, d_ids = self.executor.read_samples(n_p, n_d)
+        p_ids, d_ids, d_lens = self.executor.read_samples(n_p, n_d)
 
         # 调度器根据采样结果更新各序列状态：
         #   追加新 token、判断是否结束、回收已完成序列的 KV 块。
-        outputs = self.scheduler.update(sched, p_ids, d_ids)
+        outputs = self.scheduler.update(sched, p_ids, d_ids, d_lens)
         return outputs, metric
 
     # ------------------------------------------------------------------ #

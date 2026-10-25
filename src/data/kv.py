@@ -82,11 +82,12 @@ class KVManager:
         if isinstance(self.index, RadixPrefixIndex) and max_cached > 0:
             self.index.pin_match(seq, max_cached)
 
-    def can_append(self, seq: Sequence) -> bool:
-        return self.blocks.can_append(seq)
+    def can_append(self, seq: Sequence, n: int = 1) -> bool:
+        """本步要写入 n 个位置（n=1 普通 decode；投机 verify 为 1+k）。"""
+        return self.blocks.can_append_n(seq, n)
 
-    def may_append(self, seq: Sequence) -> None:
-        self.blocks.may_append(seq)
+    def may_append(self, seq: Sequence, n: int = 1) -> None:
+        self.blocks.may_append_n(seq, n)
 
     def sync_prefix(self, seq: Sequence) -> None:
         """本步写满的新块登记进前缀索引，供后来的请求命中。"""

@@ -112,7 +112,9 @@ class Executor(ABC):
     def run(self, sched: ScheduledBatch) -> tuple[int, int]: ...
 
     @abstractmethod
-    def read_samples(self, n_p: int, n_d: int) -> tuple[list[int], list[int]]: ...
+    def read_samples(
+        self, n_p: int, n_d: int
+    ) -> tuple[list[int], list[int], list[int] | None]: ...
 
     @abstractmethod
     def destroy(self) -> None: ...
@@ -191,8 +193,8 @@ def worker_loop(worker: Worker) -> None:
 
         n_p, n_d = counts
         channel.send(enc.encode([n_p, n_d]), dst=0)
-        p_ids, d_ids = worker.read_samples(n_p, n_d)
-        channel.send(enc.encode([p_ids, d_ids]), dst=0)
+        p_ids, d_ids, d_lens = worker.read_samples(n_p, n_d)
+        channel.send(enc.encode([p_ids, d_ids, d_lens or []]), dst=0)
 
 
 # ------------------------------------------------------------------ #
@@ -236,7 +238,9 @@ class UniprocExecutor(Executor):
         assert counts is not None
         return counts
 
-    def read_samples(self, n_p: int, n_d: int) -> tuple[list[int], list[int]]:
+    def read_samples(
+        self, n_p: int, n_d: int
+    ) -> tuple[list[int], list[int], list[int] | None]:
         return self.worker.read_samples(n_p, n_d)
 
     def collective_rpc(self, op: str, **payload) -> object:
@@ -406,17 +410,23 @@ class MultiprocExecutor(Executor):
         n_p, n_d = self._dec_counts.decode(self._channel.recv(self.sampler_rank))
         return n_p, n_d
 
-    def read_samples(self, n_p: int, n_d: int) -> tuple[list[int], list[int]]:
+    def read_samples(
+        self, n_p: int, n_d: int
+    ) -> tuple[list[int], list[int], list[int] | None]:
         """
             读取采样结果。
 
             采样在 rank0 时直接本地读取；
             否则等待采样 rank 通过 Gloo 送回 token id 列表。
+
+            ``d_lens`` 仅在投机 decode 下非空（每序列的 token 数）。
         """
         if self.sampler_rank == 0:
             return self.worker.read_samples(n_p, n_d)
-        p_ids, d_ids = self._dec_sample.decode(self._channel.recv(self.sampler_rank))
-        return p_ids, d_ids
+        msg = self._dec_sample.decode(self._channel.recv(self.sampler_rank))
+        p_ids, d_ids = msg[0], msg[1]
+        d_lens = msg[2] if len(msg) > 2 and msg[2] else None
+        return p_ids, d_ids, d_lens
 
     def shutdown(self) -> None:
         """广播 shutdown 命令，通知所有子进程退出命令循环。"""

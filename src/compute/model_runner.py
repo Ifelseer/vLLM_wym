@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 import torch
 
 from ..config import EngineConfig
 from ..data import SchedulerOutput, SeqSchedule
+from ..spec.verify import accept_greedy
 from ..distributed import (
     IntermediateTensors,
     get_pp_group,
@@ -17,6 +20,17 @@ from .cuda_graph import CUDAGraphRunner
 from .kv_pool import KVPool
 from .layers.attention import AttnInputs, AttnMetadata, attention_context
 from .sampler import Sampler
+
+
+@dataclass
+class _SpecSamples:
+    """投机 decode 的结果：扁平 token 列表 + 每序列 token 数。
+
+    ``lens[i] = 接受该序列的草稿数 + 1``（+1 是 anchor 位置产生的新 token）。
+    """
+
+    tokens: list[int] = field(default_factory=list)
+    lens: list[int] = field(default_factory=list)
 
 
 class ModelRunner:
@@ -98,6 +112,8 @@ class ModelRunner:
         self._copy_stream = torch.cuda.Stream(device=device)
         self._copy_event = torch.cuda.Event()
         self._sample_cpu = torch.empty(max_bs * 2, dtype=torch.int64, pin_memory=True)
+        # 投机 decode 的同步结果（普通 decode 复用 _sample_cpu 的异步 D2H）
+        self._spec: _SpecSamples | None = None
 
         self.cuda_graph_runner: CUDAGraphRunner | None = None
         if not config.enforce_eager:
@@ -265,6 +281,8 @@ class ModelRunner:
     def _run_decode(self, seqs: list[SeqSchedule]):
         if not seqs:
             return None
+        if self.config.spec_tokens > 0 and any(s.draft_ids for s in seqs):
+            return self._run_verify(seqs)
         bs = len(seqs)
         pad_to = (
             self.cuda_graph_runner._pad_bs(bs)
@@ -304,6 +322,65 @@ class ModelRunner:
                 return None
 
         return self._sample_logits(hidden, bs)
+
+    @torch.inference_mode()
+    def _run_verify(self, seqs: list[SeqSchedule]) -> "_SpecSamples | None":
+        """投机验证：一次因果前向算出 ``[anchor] + drafts`` 全部位置的 logits。
+
+        greedy 接受规则：位置 ``p+i`` 的 argmax 预测的是 ``p+i+1`` 的 token，
+        所以草稿 ``drafts[j]`` 被接受 ⟺ ``argmax(logits[j]) == drafts[j]``。
+        取最长可接受前缀 j 后，第 j+1 个 token 由 ``logits[j]`` 给出（全接受时
+        是最后一个位置的 bonus）。
+
+        为什么复用 prefill 通路：verify 本质是「一段带因果掩码的多 token
+        前向 + 读已有 KV」，与带前缀缓存的 prefill 完全同构（``cu_seqlens`` +
+        ``block_tables``），不需要为它单独写 attention 内核。
+
+        注意：这里 ``argmax().tolist()`` 是一次同步读回。接受裁决是控制面
+        决策（决定 KV 账本），无法像普通 decode 那样只把 id 异步 D2H；v1 每次
+        只读 ≤8 个整数，开销可忽略，Phase 5 再考虑把裁决整体搬到 GPU。
+        """
+        assert len(seqs) == 1, "v1 speculative decode supports a single sequence"
+        s = seqs[0]
+        drafts = list(s.draft_ids)
+        m = 1 + len(drafts)
+
+        vseq = SeqSchedule(
+            seq_id=s.seq_id,
+            block_table=s.block_table,
+            num_cached_tokens=s.num_cached_tokens,
+            token_ids=[s.token_ids[-1]] + drafts,
+            need_sample=False,
+            temperature=s.temperature,
+            top_p=s.top_p,
+            top_k=s.top_k,
+            min_p=s.min_p,
+        )
+        n_tokens, max_q, max_k, has_cache = self.batch.build_prefill([vseq])
+        assert n_tokens == m, f"verify built {n_tokens} tokens, expected {m}"
+        if self._fp8_kv is not None and has_cache:
+            self._fp8_kv.plan_prefill(
+                self.batch.cu_seqlens_q[:2],
+                self.batch.cu_seqlens_k[:2],
+                self.batch.block_tables[:1],
+            )
+        it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
+        with attention_context(self._meta):
+            hidden = self.model(
+                self.batch.input_ids[:n_tokens],
+                self.batch.positions[:n_tokens],
+                self._prefill_attn(1, n_tokens, max_q, max_k, has_cache),
+                it,
+            )
+        if not self.is_last_pp:
+            self._send_intermediate(hidden)
+            return None
+        if not self.is_driver:
+            return _SpecSamples()
+
+        preds = self.model.compute_logits(hidden).argmax(dim=-1).tolist()
+        toks, _accepted = accept_greedy(drafts, preds)
+        return _SpecSamples(tokens=toks, lens=[len(toks)])
 
     def _prefill_attn(
         self,
@@ -395,28 +472,43 @@ class ModelRunner:
         )
 
     def _stage_samples(
-        self, p: torch.Tensor | None, d: torch.Tensor | None
+        self, p: torch.Tensor | None, d: torch.Tensor | "_SpecSamples | None"
     ) -> tuple[int, int]:
+        spec = d if isinstance(d, _SpecSamples) else None
+        self._spec = spec
         n_p = 0 if p is None else p.numel()
-        n_d = 0 if d is None else d.numel()
+        if spec is not None:
+            # 投机路径的 token 已在 _run_verify 里同步取回，不再走 pinned 缓冲
+            n_d = len(spec.tokens)
+        else:
+            n_d = 0 if d is None else d.numel()
         need = n_p + n_d
         if need > self._sample_cpu.numel():
             self._sample_cpu = torch.empty(need, dtype=torch.int64, pin_memory=True)
         cur = torch.cuda.current_stream()
         self._copy_stream.wait_stream(cur)
         with torch.cuda.stream(self._copy_stream):
-            if d is not None:
+            if spec is None and d is not None:
                 self._sample_cpu[:n_d].copy_(d, non_blocking=True)
             if p is not None:
                 self._sample_cpu[n_d : n_d + n_p].copy_(p, non_blocking=True)
         self._copy_event.record(self._copy_stream)
         return n_p, n_d
 
-    def read_samples(self, n_p: int, n_d: int) -> tuple[list[int], list[int]]:
+    def read_samples(
+        self, n_p: int, n_d: int
+    ) -> tuple[list[int], list[int], list[int] | None]:
+        """返回 ``(prefill_ids, decode_ids, decode_lens)``。
+
+        ``decode_lens`` 仅在投机 decode 下非 None：``decode_ids`` 是各序列的
+        token 拼接，``decode_lens[i]`` 表示第 i 条序列占了几个（= 接受草稿数+1）。
+        """
         self._copy_event.synchronize()
         p_ids = self._sample_cpu[n_d : n_d + n_p].tolist() if n_p else []
+        if self._spec is not None:
+            return p_ids, list(self._spec.tokens), list(self._spec.lens)
         d_ids = self._sample_cpu[:n_d].tolist() if n_d else []
-        return p_ids, d_ids
+        return p_ids, d_ids, None
 
     def _resolve_compile_mode(self) -> str:
         """单卡 / 仅 PP 用用户 mode；含 TP 时用 max-autotune-no-cudagraphs。"""

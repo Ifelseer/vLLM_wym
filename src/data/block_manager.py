@@ -142,10 +142,25 @@ class BlockManager:
             self.cached_ids.pop(bid, None)
             self.free_ids.append(bid)
 
+    def needed_append(self, seq, n: int = 1) -> int:
+        """本步要写入 ``n`` 个 token 时，还缺几个物理页。
+
+        ``n=1`` 是普通 decode；投机解码的 verify 一步写 ``1+k`` 个位置。
+        以 ``num_cached_tokens + n`` 为准（而不是 ``len(seq)``），这样被拒草稿
+        造成的「块表已多于逻辑长度」是幂等的——不会重复分配。
+        """
+        want = (seq.num_cached_tokens + n + self.block_size - 1) // self.block_size
+        return max(0, want - len(seq.block_table))
+
+    def can_append_n(self, seq, n: int = 1) -> bool:
+        return self.needed_append(seq, n) <= self.available_slots
+
+    def may_append_n(self, seq, n: int = 1) -> None:
+        for _ in range(self.needed_append(seq, n)):
+            seq.block_table.append(self.allocate_fresh())
+
     def can_append(self, seq) -> bool:
-        need_new = len(seq) % self.block_size == 1
-        return (not need_new) or self.available_slots >= 1
+        return self.can_append_n(seq, 1)
 
     def may_append(self, seq) -> None:
-        if len(seq) % self.block_size == 1:
-            seq.block_table.append(self.allocate_fresh())
+        self.may_append_n(seq, 1)

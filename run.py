@@ -68,6 +68,8 @@ DEFAULTS = {
     "moe_backend": "auto",
     "quantization": "none",
     "quant_kv_cache": False,
+    "spec_tokens": 0,
+    "spec_draft": "ngram",
 }
 
 
@@ -103,6 +105,8 @@ def _make_engine(cfg: dict) -> Engine:
             moe_backend=cfg.get("moe_backend", "auto"),
             quantization=cfg.get("quantization", "none"),
             quant_kv_cache=bool(cfg.get("quant_kv_cache", False)),
+            spec_tokens=int(cfg.get("spec_tokens", 0)),
+            spec_draft=cfg.get("spec_draft", "ngram"),
         )
     )
 
@@ -261,6 +265,19 @@ def main() -> None:
         help="FP8 KV cache（仅 fp8 路径 + SM89+；自动切 FlashInfer attention）",
     )
     p.add_argument(
+        "--spec-tokens",
+        type=int,
+        default=None,
+        help="投机解码草稿长度 k（0=关闭；开启后每步 verify 写入 1+k 个位置；"
+        "v1 要求 max_num_seqs=1）",
+    )
+    p.add_argument(
+        "--spec-draft",
+        choices=("ngram", "dspark"),
+        default=None,
+        help="草稿来源：ngram=后缀匹配（无模型）/ dspark=DSpark 草稿头（Phase 3）",
+    )
+    p.add_argument(
         "--pp-layer-counts",
         type=str,
         default=None,
@@ -319,6 +336,10 @@ def main() -> None:
         cfg["quantization"] = args.quantization
     if args.quant_kv_cache:
         cfg["quant_kv_cache"] = True
+    if args.spec_tokens is not None:
+        cfg["spec_tokens"] = args.spec_tokens
+    if args.spec_draft is not None:
+        cfg["spec_draft"] = args.spec_draft
 
     if args.batch:
         run_batch(cfg)

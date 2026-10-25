@@ -57,6 +57,7 @@ def _decode_schedule(s: Sequence) -> "SeqSchedule":
         top_p=top_p,
         top_k=top_k,
         min_p=min_p,
+        draft_ids=s.draft_token_ids,
     )
 
 
@@ -96,6 +97,9 @@ class SeqSchedule(msgspec.Struct):
     top_p: float | None = None
     top_k: int | None = None
     min_p: float | None = None
+    # 投机解码：待验证草稿。非空时 Worker 走 verify 路径（[anchor] + drafts
+    # 一次前向），返回值是「接受的草稿 + 1 个新 token」。
+    draft_ids: list[int] = msgspec.field(default_factory=list)
 
 
 class SchedulerOutput(msgspec.Struct):
