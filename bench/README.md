@@ -67,3 +67,27 @@ PYTHONPATH=. python bench/vs_vllm.py --model ~/huggingface/Qwen3-0.6B-FP8 \
 
 预量化 checkpoint 的注册表与有效显存估算见
 `python run.py --list`（`QUANT_REGISTRY`，来源核验日 2026-10-12）。
+
+## 投机解码（spec）
+
+```bash
+# baseline(spec=0) 与 spec(k) 同一 prompt 对比；greedy 下必须 100% 一致
+PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-0.6B \
+    --spec-tokens 4 --cg --n 64 --json spec.json
+
+# 温度采样：只对比吞吐（一致率列无意义）
+PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-0.6B \
+    --spec-tokens 4 --temperature 0.8 --cg
+
+# 与量化组合（Phase 5 矩阵的一格）
+PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-0.6B-FP8 \
+    --quantization auto --spec-tokens 4 --cg
+```
+
+`spec_bench.py` 额外输出 `accept_rate`（草稿被接受比例）与 `accept_len`
+（每验证步平均产出 token 数，上限 `k+1`）。**口径纪律**：`--temperature 0`
+下 `greedy 逐 token 一致率` 必须 100%——投机解码是无损加速，任何分叉都是
+verify/KV 回滚的 bug，不是精度差异。
+
+v1 的 verify 是单序列实现，脚本固定 `max_num_seqs=1`；多序列（每序列一棵树）
+留到 v2，见 [docs/dspark-plan.md](../docs/dspark-plan.md)。

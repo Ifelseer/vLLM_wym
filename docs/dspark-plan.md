@@ -84,7 +84,10 @@
 **已验证（CPU，24 项）**：草稿器边界（k/预算/最近匹配）、`accept_greedy` 的 off-by-one 全枚举、块账本幂等、落账不变量、`spec_tokens=0` 回归。
 **未验证**：GPU 端到端逐位一致（需 `Qwen3-0.6B` 权重，本机未下载）。测试已写好：`tests/gpu/test_spec_ngram_e2e.py`，同时断言"草稿被提出且被接受"以防空跑。
 
-**已知限制**：单序列；`_run_verify` 里 `argmax().tolist()` 是同步读回（Phase 5 再考虑搬到 GPU）；树形验证与温度采样尚未接入（Phase 2/4）。
+**已知限制**：单序列；`_run_verify` 里 `argmax().tolist()` 是同步读回（Phase 5 再考虑搬到 GPU）；
+**verify 步走 eager**（复用 prefill 通路，不进 decode CUDA Graph），所以开投机后每步的
+launch 开销不再被图摊薄——Phase 5 需要按 verify 的节点数分档录图，否则小模型上可能
+"接受了草稿但总吞吐反而下降"。树形验证尚未接入（Phase 4）。
 
 ### Phase 2 温度采样 + 拒绝采样
 
