@@ -172,7 +172,8 @@ python bench/vs_vllm.py --model ~/huggingface/Qwen3-0.6B --quantization fp8
 
 ## 8. DSpark（投机解码）扩展点
 
-本轮**不实现** DSpark，只保留以下挂载点，避免后续改动扩散：
+DSpark 已单独立项（见 [dspark-plan.md](dspark-plan.md) 与 [dspark-spec.md](dspark-spec.md)）。
+本节记录**量化侧**为它保留的挂载点，避免后续改动扩散：
 
 | 挂载点 | 位置 | 说明 |
 |---|---|---|

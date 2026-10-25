@@ -12,6 +12,8 @@
 | [quantization.md](quantization.md) | 量化参考手册：scale 模式、checkpoint 格式矩阵、硬件支持矩阵、测试矩阵与阈值依据、关键实现约定、DSpark 扩展点、已知限制 |
 | [fp8-debug-report.md](fp8-debug-report.md) | FP8 W8A8 落地调试：6 个缺陷的现象 / 判定依据 / 修复取舍，以及验收容差的定界过程 |
 | [quantization-bench.md](quantization-bench.md) | 单卡 Qwen3-8B batch-8 量化基准：BF16 / FP8 / INT8 的 TTFT、吞吐、显存对比与成因分析 |
+| [dspark-plan.md](dspark-plan.md) | DSpark 投机解码实施计划：三项决策、五阶段范围、验收口径与风险清单 |
+| [dspark-spec.md](dspark-spec.md) | DSpark 上游规格核实：草稿结构/权重名/推理协议/精确配置，以及与本引擎的落差 |
 
 ## 代码地图
 

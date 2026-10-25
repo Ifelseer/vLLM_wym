@@ -1,0 +1,168 @@
+# DSpark 上游规格核实（Phase 0 产出）
+
+> 来源：`github.com/deepseek-ai/DeepSpec`（MIT），读取日 **2026-10-25**（main 分支）。
+> 论文：arXiv 2607.05147《DSpark: Confidence-Scheduled Speculative Decoding with
+> Semi-Autoregressive Generation》。
+> 本文只记录**从源码读到的事实**，推断性内容标注「推断」。
+
+---
+
+## 1. 发布的草稿 checkpoint
+
+README 的 Table 1 给出三算法 × 四目标模型的矩阵，DSpark 一行：
+
+| 目标模型 | 草稿 repo | 训练配置 |
+|---|---|---|
+| `Qwen/Qwen3-4B` | `deepseek-ai/dspark_qwen3_4b_block7` | `config/dspark/dspark_qwen3_4b.py` |
+| **`Qwen/Qwen3-8B`** | **`deepseek-ai/dspark_qwen3_8b_block7`** | `config/dspark/dspark_qwen3_8b.py` |
+| `Qwen/Qwen3-14B` | `deepseek-ai/dspark_qwen3_14b_block7` | `config/dspark/dspark_qwen3_14b.py` |
+| `google/gemma-4-12B-it` | `deepseek-ai/dspark_gemma4_12b_block7` | `config/dspark/dspark_gemma4_12b.py` |
+
+同一批还发布了 **Eagle3**（`eagle3_qwen3_8b_ttt7`）与 **DFlash**（`dflash_qwen3_8b_block7`）
+作为对照，可用于消融与 baseline。
+
+---
+
+## 2. Qwen3-8B 的精确配置
+
+`config/dspark/dspark_qwen3_8b.py`：
+
+```python
+block_size = 7                      # 每块 7 个候选（含 anchor 位）
+num_draft_layers = 5                # 草稿 5 层
+target_layer_ids = [1, 9, 17, 25, 33]   # 取目标模型这 5 层的 hidden
+mask_token_id = 151669              # 块内占位 token（Qwen3 词表内）
+num_anchors = 512                   # 训练时每样本采样的 anchor 数（推理无关）
+markov_rank = 256                   # 马尔可夫头低秩维度
+markov_head_type = 'vanilla'
+confidence_head_alpha = 1.0         # >0 即启用置信度头
+confidence_head_with_markov = True  # 置信度头输入 = hidden ⊕ markov embedding
+loss_decay_gamma = 4.0              # 块内位置衰减（训练）
+ce_loss_alpha = 0.1; l1_loss_alpha = 0.9
+```
+
+对应 Qwen3-8B 的 `hidden_size=4096`、`num_hidden_layers=36`、`vocab_size=151936`。
+所以草稿的 `fc` 输入维是 `5 × 4096 = 20480`。
+
+> 注：`target_layer_ids` 是**0 基层号**，取 hidden 时用 `hidden_states[layer_id + 1]`
+> （`hidden_states[0]` 是 embedding 输出），见 `common.py::extract_context_feature`。
+
+---
+
+## 3. 草稿模型结构（`deepspec/modeling/dspark/qwen3/modeling.py`）
+
+```python
+class Qwen3DSparkModel(Qwen3PreTrainedModel):
+    embed_tokens = nn.Embedding(vocab_size, hidden_size)        # 从目标模型拷贝后冻结
+    layers       = [Qwen3DSparkDecoderLayer] * num_draft_layers # = 5，full_attention
+    norm         = Qwen3RMSNorm(hidden_size)
+    rotary_emb   = Qwen3RotaryEmbedding(config)
+    fc           = nn.Linear(len(target_layer_ids)*hidden, hidden, bias=False)   # 20480→4096
+    hidden_norm  = Qwen3RMSNorm(hidden_size)
+    lm_head      = nn.Linear(hidden_size, vocab_size, bias=False)  # 从目标模型拷贝后冻结
+    markov_head  = build_markov_head(config)      # rank=256, vanilla
+    confidence_head = AcceptRatePredictor(hidden + markov_rank)   # → 1 维 logit
+```
+
+要点：
+
+- **词表与目标一致**：`build_draft_config` 里 `tie_word_embeddings=False`，但 `vocab_size`
+  沿用目标模型；`initialize_embeddings_and_head` 把 target 的 embed/lm_head 权重拷进来后
+  冻结。→ **不存在 draft_vocab → target_vocab 的映射问题**（与 vLLM 里 `draft_vocab_size`
+  的兼容分支无关，后者面向其他形态）。
+- **草稿注意力是双流的**（`Qwen3DSparkAttention.forward`）：
+  ```python
+  k = cat([k_proj(target_hidden_states), k_proj(hidden_states)])   # 上下文流 + 块流
+  v = cat([v_proj(target_hidden_states), v_proj(hidden_states)])
+  ```
+  即每层都对「目标 hidden 特征」算一份 K/V，再拼上块内 K/V。`target_hidden_states` 在
+  `_forward_backbone` 里先过 `fc + hidden_norm`。
+- **块内非因果**：`self.is_causal = False`，训练时由 `flex_attention` 的 mask 保证
+  「块内互看、跨块不可见」；推理时 `attention_mask=None, is_causal=False`，因为跨块隔离
+  由「块 KV 用完即丢」+ cache 结构保证。
+- **markov head**：块内候选不是独立采样的，`sample_draft_tokens` 走
+  `markov_head.sample_block_tokens(base_logits, first_prev_token_ids, hidden_states, T)`，
+  用 rank=256 的低秩转移注入前后依赖（半自回归）。
+- **confidence head**：`predict_confidence_step(hidden, prev_token_ids)` → 每位置一个 logit，
+  推理时取 `sigmoid < threshold` 的首个位置截断 proposal。
+
+---
+
+## 4. 推理协议（`deepspec/eval/dspark/draft_ops.py` + `evaluator.py`）
+
+### 4.1 初始化（prefill 后）
+
+```python
+context.target_hidden_states = extract_context_feature(
+    initial_output.hidden_states, draft_model.target_layer_ids)   # [1, prompt_len, 20480]
+context.past_key_values_draft = DynamicCache()
+```
+
+### 4.2 每一步 propose
+
+```python
+draft_input_ids = full((1, 7), mask_token_id)     # 7 个占位
+draft_input_ids[:, 0] = output_ids[:, start]      # 第 0 位放 anchor（最后接受的 token）
+
+block_hidden = model._forward_backbone(
+    target_hidden_states=context.target_hidden_states,   # 上一步验证出的新 context 片段
+    noise_embedding=embed_tokens(draft_input_ids),
+    position_ids=position_ids[:, pkv.len : start+7],     # 绝对位置 start..start+6
+    attention_mask=None,                                 # 非因果
+    past_key_values=past_key_values_draft, use_cache=True, is_causal=False)
+
+past_key_values_draft.crop(start)                  # ← 丢掉块内 KV，只保留 context
+```
+
+产物：`block_hidden [1, 7, 4096]` → `base_logits = lm_head(...)` →
+`sample_draft_tokens(..., temperature)` → `sampled_tokens [1, 7]` →
+confidence 截断得 `n = proposal_draft_tokens` →
+`verify_input_ids = [anchor, d1..dn]`、`draft_probs = softmax(draft_logits[:n] / T)`。
+
+### 4.3 验证与更新
+
+```python
+verification = 目标模型对 [anchor, d1..dn] 做一次因果前向（n+1 个 token）
+   → 逐位接受/拒绝（标准拒绝采样，见 base_evaluator）
+context.target_hidden_states = extract_context_feature(verification.hidden_states)[:, :accepted+1]
+```
+
+### 4.4 与 vLLM 的对照
+
+vLLM 的 `SpeculativeConfig` 对 `method="dspark"` 做了四件事，与上面一致：
+
+```python
+uses_aux_hidden_states = True              # 要目标模型的中层 hidden
+parallel_drafting = True                   # 块内并行草稿
+num_speculative_tokens = block_size        # 默认取 checkpoint 的 block_size
+enable_adaptive_verification               # confidence 调度（仅 dspark）
+```
+
+---
+
+## 5. 与本引擎的落差（改造清单输入）
+
+| 需要 | 我们的现状 | 缺口 |
+|---|---|---|
+| 目标模型输出 5 层 aux hidden | `Qwen3ForCausalLM.forward` 只返回最终 hidden | 增加 `output_aux_hidden_states` + 静态输出缓冲（CG）、PP 汇总 |
+| 草稿模型 | 无 | vendor `modeling.py` + `markov_head.py`（MIT，约 30 KB）或 `pip install deepspec` |
+| 草稿 KV cache | 无（引擎 KV 池是给 target 的） | 草稿用独立的 `DynamicCache`/自建小池；每步 `crop` |
+| 一步生成多个 token | `num_scheduled_tokens = 1` 硬编码 4 处 | Phase 1 的改动点 |
+| 多 token 验证 | decode 路径假设 `M == bs` | 复用 prefill/因果路径（线性）；树形需自写 mask kernel |
+| 采样概率 | `Sampler` 只返回 id | 新增 `logprobs()` 支路 |
+| token 回滚 | 只能 append | `Sequence.truncate_to(n)` + 先裁决后 publish |
+
+---
+
+## 6. 待上机确认（Phase 0 剩余）
+
+1. **checkpoint 是否自带 remote code**：`deepseek-ai/dspark_qwen3_8b_block7` 里是否有
+   `modeling_*.py`。若无 → 必须 vendor DeepSpec 的 `modeling.py`（依赖
+   `transformers.models.qwen3.modeling_qwen3` 的 `Qwen3MLP/Qwen3RMSNorm/Qwen3RotaryEmbedding`）。
+2. **config.json 实际字段**：`block_size` / `target_layer_ids` / `markov_rank` /
+   `mask_token_id` / `vocab_size` 是否与训练配置一致（训练配置不一定等于发布配置）。
+3. **`crop(start)` 的确切语义**：`start` 是「anchor 在序列中的位置」还是「草稿 KV 的已有长度」？
+   需读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB，本次未取）。
+   这决定我们草稿 KV 的追加/回滚规则——**Phase 3 前必须读**。
+4. **vLLM 基线**：4090 上跑 `Qwen3-8B + dspark_qwen3_8b_block7`，记录 acceptance length、
+   decode tok/s、以及与我们树形方案的对照口径。
