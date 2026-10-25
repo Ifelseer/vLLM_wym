@@ -159,8 +159,24 @@ enable_adaptive_verification               # confidence 调度（仅 dspark）
 ### 6.1 已确认
 
 1. **checkpoint 不自带 remote code**：仓库只有 `config.json` + `model.safetensors`（4.5 GB），
-   没有 `modeling_*.py`。→ 必须 **vendor DeepSpec 的 `deepspec/modeling/dspark/`**
-   （`qwen3/modeling.py` 20 KB + `common.py` 9.5 KB + `markov_head.py` 10.9 KB，均为 MIT）。
+   没有 `modeling_*.py`。→ **已 vendor**（2026-10-25），落在 `src/spec/dspark/`：
+
+   | 上游 | 本地 |
+   |---|---|
+   | `deepspec/modeling/dspark/qwen3/modeling.py` | `src/spec/dspark/modeling.py` |
+   | `deepspec/modeling/dspark/qwen3/config.py` | `src/spec/dspark/config.py` |
+   | `deepspec/modeling/dspark/common.py` | `src/spec/dspark/common.py` |
+   | `deepspec/modeling/dspark/markov_head.py` | `src/spec/dspark/markov_head.py` |
+   | `deepspec/utils/sampling.py`（仅 `sample_tokens`）+ `metrics.py`（`add_metric`） | `src/spec/dspark/_compat.py` |
+
+   均为 MIT，每个文件带 provenance 头。**本地只改三处**：① `deepspec.*` → 相对导入；
+   ② `create_block_mask` 改函数内惰性导入（训练/教师强制才用，推理不碰，避免因一个
+   训练依赖让推理 import 失败）；③ 加头注释。
+
+   **CPU 冒烟已过**（`tests/unit/test_dspark_vendor.py`，7 项）：vendored 模块可独立
+   import（`deepspec.*` 依赖已切断）、8 个符号齐全、极小配置下双流注意力前向形状正确、
+   `sample_draft_tokens` 的 markov 偏置确实生效、`predict_confidence_step` 输出逐位置
+   logit、`extract_context_feature` 的 0 基/`-1` 语义正确。
 2. **实际 config 与训练配置一致**：
 
    ```

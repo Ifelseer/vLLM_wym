@@ -206,6 +206,17 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 
 ### Phase 3 DSpark 草稿接入（4090）
 
+> **进度（2026-10-25）**：草稿侧已落地 ✅
+> - `src/spec/dspark/`：vendored `modeling.py` / `common.py` / `markov_head.py` /
+>   `config.py` + `_compat.py`（替代 `deepspec.utils.{sampling,metrics}`）+ `loader.py`
+>   （`load_dspark_draft()` 直接 `Qwen3DSparkModel.from_pretrained`，含 8 符号检查与
+>   config 字段校验）；
+> - `tests/unit/test_dspark_vendor.py` 7 项 CPU 冒烟全过（双流注意力 / markov 偏置 /
+>   confidence 头 / context 特征抽取），**不需要 checkpoint 也不需要 GPU**；
+> - 仍未做：目标模型的 **aux hidden states 输出**（`target_layer_ids=[1,9,17,25,33]`，
+>   `hidden_states[layer_id+1]` 口径）、`DSparkDrafter` 接入 `Drafter` 接口、草稿 KV
+>   的追加/回滚（规则见 [dspark-spec.md](dspark-spec.md) §6.3）。
+
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 
 **验收**：acceptance length ≥ vLLM/DeepSpec 基线的 90%；Qwen3-8B/4090/batch=1/256-prompt decode ≥1.4×；greedy 逐位一致。
