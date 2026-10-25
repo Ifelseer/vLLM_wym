@@ -206,6 +206,19 @@ class Qwen3Model(nn.Module):
             if pp.is_last_rank
             else PPMissingLayer()
         )
+        self.hidden_size = config.hidden_size
+        # aux hidden states（DSpark 草稿的 context 特征）：{全局层号: 第几个槽}
+        # 默认空 → 上面循环里连判断都省掉，零开销、零行为变化。
+        self._aux_slots: dict[int, int] = {}
+
+    def set_aux_hidden_layers(self, layer_ids: list[int]) -> None:
+        """让第 ``layer_id`` 层（0 基）的输出写进 aux 缓冲的第几个槽。
+
+        DSpark 的 ``target_layer_ids`` 口径是 ``hidden_states[layer_id + 1]``，
+        即**第 layer_id 层跑完之后**的残差流值。本引擎用融合残差（``h`` 与
+        ``residual`` 两段，下一次 norm 时才相加），所以这里取 ``h + residual``。
+        """
+        self._aux_slots = {int(lid): i for i, lid in enumerate(layer_ids)}
 
     def forward(
         self,
@@ -213,6 +226,7 @@ class Qwen3Model(nn.Module):
         positions: torch.Tensor,
         attn: AttnInputs,
         intermediate_tensors: IntermediateTensors | None = None,
+        aux_hidden_out: torch.Tensor | None = None,
     ):
         if intermediate_tensors is None:
             # 首个 PP stage 从 input_ids 计算 Embedding
@@ -222,8 +236,15 @@ class Qwen3Model(nn.Module):
             h = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
         # 处理当前 PP 负责的 Transformer 层
-        for layer in self.layers:
+        aux_slots = self._aux_slots if aux_hidden_out is not None else None
+        for i, layer in enumerate(self.layers):
             h, residual = layer(positions, h, residual, attn)
+            if aux_slots:
+                slot = aux_slots.get(self.start_layer + i)
+                if slot is not None and residual is not None:
+                    # 原地写入预分配缓冲：不新建中间张量，尺寸固定
+                    lo = slot * self.hidden_size
+                    torch.add(h, residual, out=aux_hidden_out[:, lo : lo + self.hidden_size])
         # 最后一个 PP stage 进行最终归一化
         if get_pp_group().is_last_rank:
             return self.norm(h, residual)[0]
@@ -247,10 +268,13 @@ class Qwen3ForCausalLM(nn.Module):
         input_ids: torch.Tensor, 
         positions: torch.Tensor, 
         attn: AttnInputs, 
-        intermediate_tensors: IntermediateTensors | None = None
+        intermediate_tensors: IntermediateTensors | None = None,
+        aux_hidden_out: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
 
-        return self.model(input_ids, positions, attn, intermediate_tensors)
+        return self.model(
+            input_ids, positions, attn, intermediate_tensors, aux_hidden_out
+        )
 
     def compute_logits(self, hidden_states):
         """ 计算全量的 logits """

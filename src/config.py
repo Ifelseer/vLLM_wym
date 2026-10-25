@@ -96,6 +96,10 @@ class EngineConfig:
     # 定位是**校验/参考模式**（可证明无损），不是性能模式：accept_len 低时
     # 额外前向会把收益吃光。
     spec_exact_kv: bool = False
+    # DSpark 草稿消费的**目标模型中间层**（口径 `hidden_states[layer_id+1]`）。
+    # 必须与草稿 checkpoint 的 `target_layer_ids` 一致；Phase 3 加载草稿时会断言。
+    # 默认值是官方 `dspark_qwen3_8b_block7` 的取值。
+    spec_target_layer_ids: tuple[int, ...] = (1, 9, 17, 25, 33)
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
@@ -139,6 +143,14 @@ class EngineConfig:
                 raise ValueError(
                     f"spec_draft must be ngram|dspark, got {self.spec_draft!r}"
                 )
+            if self.spec_draft == "dspark":
+                # aux hidden 跨层采集：PP 下这些层分散在不同 stage，v1 不做汇总
+                if self.pp_size > 1:
+                    raise ValueError("spec_draft='dspark' requires pp_size == 1 in v1")
+                if not self.spec_target_layer_ids:
+                    raise ValueError(
+                        "spec_target_layer_ids must not be empty for dspark"
+                    )
         if self.spec_tie_eps < 0:
             raise ValueError(f"spec_tie_eps must be >= 0, got {self.spec_tie_eps}")
         if self.spec_tie_eps > 0 or self.spec_exact_kv:

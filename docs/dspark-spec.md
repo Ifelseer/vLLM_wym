@@ -206,6 +206,20 @@ rotate_half / ALL_ATTENTION_FUNCTIONS / GradientCheckpointingLayer / FlashAttent
 所以租机上的 4.57.6 大概率也齐（Phase 3 第一步就是跑一遍符号检查，缺哪个补哪个，不必
 为一个 config 字段去升 torch）。
 
+**已上机实测（2026-10-25，租机 transformers 4.57.6）**：`Qwen3DSparkModel.from_pretrained`
+加载官方 checkpoint 一次通过——
+
+```
+missing   : []
+unexpected: []
+params B  : 2.371
+block/target_layers/markov: 7 [1, 9, 17, 25, 33] 256
+```
+
+即**权重名与 vendored 类完全对齐**（不需要 `_keys_to_ignore` 或重命名），参数量落在
+预期区间（embed + lm_head 各 ~0.62B 冻结 + 5 层草稿），且 `loader.py` 的
+`dtype=` / `torch_dtype=` 双参数名兼容在 4.57 上生效（`dtype=` 是 4.56+ 才有的写法）。
+
 ### 6.3 `crop(start)` 语义（已核实，2026-10-25）
 
 读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB）后的结论：

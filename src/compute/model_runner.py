@@ -55,6 +55,8 @@ class ModelRunner:
         self.kv_cache = kv.kv_cache
         self.dtype = kv.dtype
         self.hidden_size = config.hf_config.hidden_size
+        # DSpark 的 aux hidden 缓冲（懒分配；关闭投机时恒为 None）
+        self._aux_buf: torch.Tensor | None = None
         self._meta = AttnMetadata(kv_cache=self.kv_cache)
 
         pp = get_pp_group()
@@ -323,6 +325,36 @@ class ModelRunner:
 
         return self._sample_logits(hidden, bs)
 
+    def _ensure_aux(self, n_tokens: int) -> torch.Tensor | None:
+        """按需分配 aux hidden 缓冲并注册要采集的层（仅 DSpark 用）。
+
+        缓冲一次分配、按 ``n_tokens`` 切片传入；前向里用 ``out=`` **原地写入**
+        （不新建中间张量），所以地址固定，将来若要进 CUDA Graph 也不用改。
+        """
+        if self.config.spec_tokens <= 0 or self.config.spec_draft != "dspark":
+            return None
+        if self._aux_buf is None:
+            ids = list(self.config.spec_target_layer_ids)
+            body = self.model.model
+            setter = getattr(body, "set_aux_hidden_layers", None)
+            if setter is None:
+                raise NotImplementedError(
+                    "spec_draft='dspark' 需要目标模型输出 aux hidden states；"
+                    f"{type(self.model).__name__} 未提供该能力（v1 仅 dense Qwen3）"
+                )
+            setter(ids)
+            self._aux_buf = torch.empty(
+                self.config.max_num_batched_tokens,
+                len(ids) * body.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+        if n_tokens > self._aux_buf.shape[0]:
+            raise ValueError(
+                f"aux buffer too small: need {n_tokens} > {self._aux_buf.shape[0]}"
+            )
+        return self._aux_buf[:n_tokens]
+
     @torch.inference_mode()
     def _run_verify(self, seqs: list[SeqSchedule]) -> "_SpecSamples | None":
         """投机验证：一次因果前向算出 ``[anchor] + drafts`` 全部位置的 logits。
@@ -371,6 +403,7 @@ class ModelRunner:
                 self.batch.positions[:n_tokens],
                 self._prefill_attn(1, n_tokens, max_q, max_k, has_cache),
                 it,
+                self._ensure_aux(n_tokens),
             )
         if not self.is_last_pp:
             self._send_intermediate(hidden)
@@ -543,7 +576,8 @@ class ModelRunner:
             )
         it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
 
-        if self.prefill_fn is not None and all(
+        aux = self._ensure_aux(n_tokens)
+        if aux is None and self.prefill_fn is not None and all(
             s.num_cached_tokens == 0 for s in seqs
         ):
             with attention_context(self._meta):
@@ -562,6 +596,7 @@ class ModelRunner:
                     self.batch.positions[:n_tokens],
                     self._prefill_attn(bs, n_tokens, max_q, max_k, has_cache),
                     it,
+                    aux,
                 )
 
         if not self.is_last_pp:

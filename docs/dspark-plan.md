@@ -213,9 +213,17 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 >   config 字段校验）；
 > - `tests/unit/test_dspark_vendor.py` 7 项 CPU 冒烟全过（双流注意力 / markov 偏置 /
 >   confidence 头 / context 特征抽取），**不需要 checkpoint 也不需要 GPU**；
-> - 仍未做：目标模型的 **aux hidden states 输出**（`target_layer_ids=[1,9,17,25,33]`，
->   `hidden_states[layer_id+1]` 口径）、`DSparkDrafter` 接入 `Drafter` 接口、草稿 KV
->   的追加/回滚（规则见 [dspark-spec.md](dspark-spec.md) §6.3）。
+> - **checkpoint 加载已实测通过**（租机 transformers 4.57.6）：`missing=[]`、
+>   `unexpected=[]`、2.371B 参数、`block=7`，权重名与 vendored 类完全对齐。
+> - **目标模型 aux hidden 已落地**（默认关闭，`spec_tokens=0` 时零开销）：
+>   `Qwen3Model.set_aux_hidden_layers()` + 层循环里 `torch.add(h, residual, out=aux[...])`
+>   **原地写入**预分配缓冲（口径 `hidden_states[layer_id+1]` = 该层跑完的残差流）；
+>   `ModelRunner._ensure_aux()` 懒分配 `[max_num_batched_tokens, 5*hidden]`，并只在
+>   `_run_prefill` / `_run_verify` 传参。**DSpark 模式强制每次走 verify（eager）**，
+>   因此完全不碰 decode CUDA Graph——这是我原本最担心的回归面，现在被绕开了。
+> - 仍未做：`DSparkDrafter` 接入 `Drafter` 接口（草稿需要 GPU，接口要从"调度器侧纯
+>   CPU 函数"改成"worker 侧组件"）、草稿 KV 的追加/回滚（规则见
+>   [dspark-spec.md](dspark-spec.md) §6.3）。
 
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 
