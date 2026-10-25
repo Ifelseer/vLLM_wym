@@ -63,8 +63,9 @@ class ModelRunner:
         self._dspark = None
         self._dspark_pending: dict[int, torch.Tensor] = {}
         self._draft_probs: torch.Tensor | None = None
-        # verify 的 CUDA Graph 分档（m -> graph）与静态输出缓冲
-        self._verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
+        self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self._verify_buckets: list[int] = []
         self._verify_out: torch.Tensor | None = None
         self._meta = AttnMetadata(kv_cache=self.kv_cache)
 
@@ -288,6 +289,18 @@ class ModelRunner:
         self._verify_out[:m].copy_(out)
         return out
 
+    def _verify_graph_bounds(self) -> list[int]:
+        """按上界生成桶：256/512/1024/2048 中不超过配置值的那些，再加配置值本身。
+
+        为什么要分桶：``max_seqlen_k`` 是 attention kernel 的标量参数，进图后不可变。
+        单个 256 桶会让所有长上下文回退 eager（n=256 之后半程全掉）。分桶后按实际
+        ``p+m`` 选**最紧**的上界，浪费的只是桶内多余 tile（空块早退），不影响正确性。
+        """
+        cap = max(1, int(self.config.spec_verify_graph_max_k))
+        bounds = [b for b in (256, 512, 1024, 2048) if b < cap]
+        bounds.append(cap)
+        return sorted(set(bounds))
+
     @torch.inference_mode()
     def _capture_verify_graphs(self) -> None:
         """按 m = 2..k+1 各录一张 verify 图（失败则整体回退 eager）。
@@ -306,8 +319,11 @@ class ModelRunner:
         if self._pp_group.size > 1:
             print("[WARN] spec_verify_graph 需要 pp_size == 1，已回退 eager verify")
             return
-        max_k = int(self.config.spec_verify_graph_max_k)
-        graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        buckets = self._verify_graph_bounds()
+        graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        # 所有 verify 图共用同一个显存池：图内的临时张量可以互相复用，
+        # 否则「桶数 × (k+1)」张图各自持有池会线性吃显存。
+        pool = torch.cuda.graph_pool_handle()
         try:
             self._verify_out = torch.empty(
                 self.config.max_num_batched_tokens,
@@ -315,13 +331,16 @@ class ModelRunner:
                 dtype=self.dtype,
                 device=self.device,
             )
-            for m in range(2, self.config.spec_tokens + 2):
-                self._fake_verify_batch(m)
-                self._verify_body(m, max_k)  # 图外 warmup：算子初始化 / autotune
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    self._verify_body(m, max_k)
-                graphs[m] = g
+            for bound in buckets:
+                for m in range(2, self.config.spec_tokens + 2):
+                    # 假批只负责把形状/指针摆好；cached 取到桶满，
+                    # 让 cu_seqlens_k 正好等于该桶的上界（kernel 参数一致）
+                    self._fake_verify_batch(m, cached=max(1, bound - m))
+                    self._verify_body(m, bound)  # 图外 warmup：初始化 / autotune
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, pool=pool):
+                        self._verify_body(m, bound)
+                    graphs[(m, bound)] = g
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - 录图失败要能整体降级
             print(
@@ -331,6 +350,7 @@ class ModelRunner:
             self._verify_out = None
             graphs.clear()
         self._verify_graphs = graphs
+        self._verify_buckets = buckets if graphs else []
 
     def _pp_dst(self) -> int:
         return self._pp_group.next_group_rank
@@ -559,10 +579,15 @@ class ModelRunner:
                 self.batch.cu_seqlens_k[:2],
                 self.batch.block_tables[:1],
             )
-        graph = self._verify_graphs.get(m)
-        if graph is not None and (
-            s.num_cached_tokens + m <= self.config.spec_verify_graph_max_k
-        ):
+        # 选最紧的桶：桶按升序，第一个装得下的就是最优（多余 tile 会早退）
+        graph = None
+        need = s.num_cached_tokens + m
+        for bound in self._verify_buckets:
+            cand = self._verify_graphs.get((m, bound))
+            if cand is not None and need <= bound:
+                graph = cand
+                break
+        if graph is not None:
             # 录图口径：build_prefill 已把 input_ids/positions/slot_mapping/
             # cu_seqlens 写进静态 GPU 缓冲，replay 只跑模型前向
             graph.replay()
