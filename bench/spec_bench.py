@@ -25,8 +25,10 @@ TTFT / decode 吞吐 / 接受率 / 接受长度 / 峰值显存 / greedy 一致�
     python bench/spec_bench.py --model ~/huggingface/Qwen3-0.6B-FP8 \
         --quantization auto --spec-tokens 4 --cg
 
-注：v1 的 verify 是单序列实现，所以本脚本固定 ``max_num_seqs=1``；
-多序列（每序列一棵树）留到 v2。
+注：``--max-num-seqs B`` 会真的并发发 B 条请求（吞吐按 B 条合计）。多序列的
+verify 是把各序列的 ``[anchor + drafts]`` 按 ``cu_seqlens`` 拼平做一次前向，落账
+逐序列进行；**但 verify 的 CUDA Graph 只在 B == 1 时生效**（多序列的
+``(bs, 每序列 m)`` 组合数爆炸），所以 B > 1 下加速比会明显低于 B == 1 的单序列值。
 """
 
 from __future__ import annotations
@@ -65,6 +67,7 @@ def _run_one(
     draft_model: str = "",
     num_blocks: int = 64,
     verify_graph: bool = False,
+    max_num_seqs: int = 1,
 ) -> dict:
     import torch
 
@@ -75,7 +78,7 @@ def _run_one(
             tp_size=tp,
             quantization=quantization,  # type: ignore[arg-type]
             enforce_eager=not cg,
-            max_num_seqs=1,
+            max_num_seqs=max_num_seqs,
             context_len=2048,
             num_kvcache_blocks=num_blocks,
             gpu_memory_utilization=0.85,
@@ -99,17 +102,20 @@ def _run_one(
         sp = SamplingParams(temperature=temperature, max_tokens=n, ignore_eos=True)
         for _ in range(reps):
             torch.cuda.reset_peak_memory_stats()
-            seq = eng.add_request(prompt, sp)
+            # 同时发 bs 条请求：batch>1 的收益只有在"真的并发"时才能测出来
+            seqs = [eng.add_request(prompt, sp) for _ in range(max_num_seqs)]
             t0 = time.perf_counter()
             first = None
             while eng.has_unfinished():
                 eng.step()
-                if first is None and seq.num_completion_tokens >= 1:
+                if first is None and any(s.num_completion_tokens >= 1 for s in seqs):
                     first = time.perf_counter()
             t1 = time.perf_counter()
             e2es.append(t1 - t0)
             ttfts.append((first - t0) * 1e3 if first else float("nan"))
-            outs.append(list(seq.token_ids[seq.num_prompt_tokens :]))
+            outs.append(
+                [list(s.token_ids[s.num_prompt_tokens :]) for s in seqs]
+            )
 
         peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
         stats = dict(eng.scheduler.spec_stats)
@@ -122,8 +128,10 @@ def _run_one(
             "spec_tokens": spec_tokens,
             "temperature": temperature,
             "ttft_ms": ttft,
-            "decode_tok_s": (n - 1) / decode_s if n > 1 else float("nan"),
-            "e2e_tok_s": n / e2e,
+            # 吞吐要乘 bs：bs 条请求在同一段墙钟里各自产出 n 个 token
+            "decode_tok_s": (n - 1) * max_num_seqs / decode_s if n > 1 else float("nan"),
+            "e2e_tok_s": n * max_num_seqs / e2e,
+            "max_num_seqs": max_num_seqs,
             "peak_mem_gb": peak_gb,
             "spec_tie_eps": tie_eps,
             "spec_exact_kv": exact_kv,
@@ -137,7 +145,9 @@ def _run_one(
             # 逐位置接受率：诊断"草稿在块内第几位开始失效"用，比 accept_len
             # 单个数字有信息量（上游 eval 也统计这个）
             "pos_rates": pos_rates,
-            "tokens": outs[-1],
+            # tokens 是 bs 条序列的结果；一致率默认比对第 0 条（bs=1 时即全部）
+            "tokens": outs[-1][0],
+            "tokens_all": outs[-1],
         }
     finally:
         eng.destroy()
@@ -170,6 +180,12 @@ def main() -> None:
         type=int,
         default=64,
         help="KV 块数。FP8 目标 + BF16 草稿约 19G，24G 卡保持 64；放不下就调小",
+    )
+    p.add_argument(
+        "--max-num-seqs",
+        type=int,
+        default=1,
+        help="并发请求数（同时也是调度器的 max_num_seqs）。>1 时量的是聚合吞吐",
     )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
@@ -220,6 +236,7 @@ def main() -> None:
         draft_model=args.spec_draft_model,
         num_blocks=args.num_kvcache_blocks,
         verify_graph=args.spec_verify_graph,
+        max_num_seqs=args.max_num_seqs,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
     # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
