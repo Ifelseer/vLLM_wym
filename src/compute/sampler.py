@@ -91,6 +91,80 @@ class Sampler(nn.Module):
             sample = torch.where(greedy_mask, logits.argmax(dim=-1), sample)
         return sample
 
+    @torch.no_grad()
+    def final_probs(
+        self,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ps: torch.Tensor | None = None,
+        top_ks: torch.Tensor | None = None,
+        min_ps: torch.Tensor | None = None,
+        *,
+        all_greedy: bool = False,
+        any_greedy: bool = False,
+        use_top_k: bool = False,
+        use_top_p: bool = False,
+        use_min_p: bool = False,
+        max_top_k: int = 0,
+    ) -> torch.Tensor:
+        """返回 ``forward`` **实际采样所用**的完整分布 ``[B, vocab]``（已归一化）。
+
+        为什么不是"直接 softmax(logits/T)"：投机解码的拒绝采样必须让最终输出
+        分布**逐位等于**普通采样，而普通采样在应用 top-k / top-p / min-p 后
+        分布已经被截断并重新归一化。若用未截断的分布做接受判定，输出分布会
+        与 baseline 不一致（top-k 时尤其明显）。
+
+        与 ``forward`` 的截断规则严格对齐：
+        - top-k：按概率降序保留前 ``top_ks[i]`` 个；
+        - top-p：在降序上按 ``cum_before <= top_p`` 保留（首项恒保留）；
+        - min-p：保留 ``p >= min_p * max_p``；
+        - greedy 行（``temperature <= 1e-5``）返回 one-hot，与 ``argmax`` 一致。
+        """
+        if all_greedy:
+            # 全贪心：分布就是 argmax 的 one-hot（提前返回，避免除以 ~0 温度）
+            return torch.zeros(
+                logits.shape[0], logits.shape[-1], dtype=torch.float32,
+                device=logits.device,
+            ).scatter_(1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        if any_greedy:
+            greedy_mask = temperatures <= 1e-5
+            safe_temp = torch.where(
+                greedy_mask, torch.ones_like(temperatures), temperatures
+            )
+        else:
+            greedy_mask = None
+            safe_temp = temperatures
+
+        probs = torch.softmax(logits.float() / safe_temp.unsqueeze(1), dim=-1)
+        keep = torch.ones_like(probs, dtype=torch.bool)
+
+        if use_top_k and max_top_k > 0:
+            kth = probs.topk(max_top_k, dim=-1).values
+            idx = (top_ks - 1).clamp(min=0, max=max_top_k - 1).unsqueeze(1)
+            threshold = kth.gather(1, idx)
+            keep &= probs >= threshold
+
+        if use_top_p:
+            sorted_p, sorted_idx = probs.sort(dim=-1, descending=True)
+            cum_before = sorted_p.cumsum(dim=-1) - sorted_p
+            keep_sorted = cum_before <= top_ps.unsqueeze(1)
+            keep_sorted[:, 0] = True
+            keep = keep.scatter(1, sorted_idx, keep_sorted & keep.gather(1, sorted_idx))
+
+        if use_min_p:
+            max_p = probs.max(dim=-1, keepdim=True).values
+            keep &= probs >= min_ps.unsqueeze(1) * max_p
+
+        out = probs * keep
+        out = out / out.sum(dim=-1, keepdim=True).clamp_min(1e-20)
+
+        if greedy_mask is not None and bool(greedy_mask.any()):
+            onehot = torch.zeros_like(out).scatter_(
+                1, logits.argmax(dim=-1, keepdim=True), 1.0
+            )
+            out = torch.where(greedy_mask.unsqueeze(1), onehot, out)
+        return out
+
     @staticmethod
     def _sample_ordered(
         vals: torch.Tensor,

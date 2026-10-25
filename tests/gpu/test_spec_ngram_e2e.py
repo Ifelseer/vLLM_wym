@@ -70,3 +70,34 @@ def test_spec_off_is_deterministic_baseline():
     _, b, _ = _run(_PROMPT, spec=0)
     assert a == b
     assert stats_a == {"steps": 0, "proposed": 0, "accepted": 0}
+
+
+def _run_temp(prompt: str | list[int], *, spec: int, temperature: float, n: int = 16):
+    with engine_session(cfg(DENSE_MODEL, max_num_seqs=1, spec_tokens=spec)) as eng:
+        seq = eng.add_request(
+            prompt,
+            SamplingParams(temperature=temperature, max_tokens=n, ignore_eos=True),
+        )
+        while not seq.is_finished:
+            eng.step()
+        out = list(seq.token_ids[seq.num_prompt_tokens :])
+        stats = dict(eng.scheduler.spec_stats)
+    return out, stats
+
+
+def test_spec_temperature_path_runs_and_keeps_invariants():
+    """温度采样下的 smoke gate。
+
+    分布等价性由 CPU 单测（``tests/unit/test_spec_rejection.py``）负责——
+    那里直接验证"输出频次 == 目标分布"，且用的是 GPU 上同一个
+    ``accept_rejection`` / ``Sampler.final_probs``，没有 GPU 专属分支。
+    这里只保证：拒绝采样路径能跑通、token 数正确、账本不变量不破。
+    """
+    prompt_ids, base, _ = _run(_PROMPT, spec=0)
+    rep_prompt = prompt_ids + base + base[:8]
+    n = 16
+    out, stats = _run_temp(rep_prompt, spec=_SPEC_K, temperature=0.8, n=n)
+    assert len(out) == n
+    assert stats["steps"] > 0, "spec path was never taken"
+    # 温度采样下草稿仍应被提出；被接受与否取决于抽样，不做强断言
+    assert stats["proposed"] > 0

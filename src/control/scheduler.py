@@ -30,6 +30,7 @@ class Scheduler:
         spec_tokens: int = 0,
         spec_draft: str = "ngram",
         max_seq_len: int | None = None,
+        drafter: Drafter | None = None,
     ) -> None:
         self.kv = kv
         self.max_num_seqs = max_num_seqs
@@ -49,11 +50,13 @@ class Scheduler:
                 "speculative decoding (spec_tokens > 0) requires "
                 f"max_num_seqs == 1 in v1, got {max_num_seqs}"
             )
-        self.drafter: Drafter | None = (
-            make_drafter(spec_draft, num_spec_tokens=self.spec_tokens)
-            if self.spec_tokens > 0
-            else None
-        )
+        if self.spec_tokens <= 0:
+            self.drafter: Drafter | None = None
+        elif drafter is not None:
+            # 允许注入（测试用的确定性草稿；Phase 3 也可能在外部构造 GPU 草稿）
+            self.drafter = drafter
+        else:
+            self.drafter = make_drafter(spec_draft, num_spec_tokens=self.spec_tokens)
         # 观测口径（bench / 测试断言用）：提出与接受的草稿数、验证步数。
         # 接受率 = accepted / proposed 是投机解码最直接的收益指标。
         self.spec_stats: dict[str, int] = {

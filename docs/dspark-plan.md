@@ -92,6 +92,45 @@
 
 **验收**：固定 seed 与 baseline 一致；10k 样本分布检验（每位置 top-1 频率差 <1%）。
 
+#### Phase 2 落地记录（2026-10-25）
+
+实际实现与最初设想有一处修正：需要的是**归一化后的概率**而不是 log-probs，
+且必须是"采样器实际使用的分布"（含 top-k / top-p / min-p 截断后重新归一化）。
+否则输出分布会与 baseline 不一致——top-k 时尤其明显。
+
+| 文件 | 内容 |
+|---|---|
+| `src/compute/sampler.py` | 新增 `final_probs()`：与 `forward` 的截断规则逐条对齐（top-k 按阈值、top-p 按 `cum_before ≤ p`、min-p 按 `p ≥ min_p·max_p`），greedy 行返回 one-hot |
+| `src/spec/verify.py` | `accept_rejection()`：逐位 `u < min(1, p/q)`；拒绝后从 `normalize(max(0, p−q))` 恢复；全接受取 bonus。`draft_probs=None` 表示确定性草稿（one-hot，`q=1`） |
+| `src/compute/model_runner.py` | `_run_verify` 按 `all_greedy` 分流：greedy → `accept_greedy`；否则 `final_probs` → `accept_rejection` |
+
+**一个必须记住的前提**：拒绝采样的正确性要求草稿 **`x_i ~ q_i`**。ngram/greedy
+草稿是 one-hot，等价于 `q_i(x_i)=1`；Phase 3 接入 DSpark 时必须传**真实的**
+草稿分布，不能把"模型最可能的值"当作确定草稿却不更新 q——那样输出分布会跑偏。
+（写测试时我第一版把草稿固定成某个 token，用固定 q 去验，得到 [0.50,0.50] vs
+期望 [0.25,0.75]，正是这个前提的体现。）
+
+**已验证（CPU，14 项）**：
+- `final_probs` 归一化 / 温度缩放 / top-k=1 与 top-k=2 / top-p / min-p / all_greedy；
+  并用 2 万次 `forward` 采样频次反证它就是"实际采样分布"；
+- `accept_rejection` 的分布等价性（2 万次试验、容差 2%≈5.6σ）：one-hot 草稿、
+  多步 k=2 的首位边际、以及**非 one-hot 草稿（x 从 q 采样）**三种情形；
+- 长度不变量 `len(tokens) == accepted + 1`。
+
+另加 `tests/unit/test_spec_scheduler_loop.py`（5 项）：用"假 target + 确定性草稿"
+驱动**真实**的 `Scheduler` / `KVManager` 跑完整生成——全接受时输出必须逐 token
+复现标准答案；周期性拒绝只校验不变量；KV 紧张与接近 context 上限时不得越界。
+它覆盖多步串接与满页边界，这类错误原本只能靠 GPU e2e 暴露。
+
+> 写这个测试时踩到两个"测试自身的错"：① `deallocate` 会把 `block_table` 清空
+> 且 `num_cached_tokens` 归零，所以序列结束后不能再断言常规不变量；② 块表只需
+> 覆盖「已写 KV 的 0..cached-1」，断言写 `ceil((cached+1)/B)` 会在 cached 恰好
+> 落在块边界时误报——真正写满那一块的是**上一步**，pending token 要到下一步才写。
+
+**未验证**：GPU 温度采样 smoke（缺模型文件）。GPU 侧复用同一批函数，没有
+GPU 专属分支；`tests/gpu/test_spec_ngram_e2e.py` 已加 smoke 用例（断言能跑通、
+token 数正确、spec 路径被走到）。
+
 ### Phase 3 DSpark 草稿接入（4090）
 
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。

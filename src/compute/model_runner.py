@@ -6,7 +6,7 @@ import torch
 
 from ..config import EngineConfig
 from ..data import SchedulerOutput, SeqSchedule
-from ..spec.verify import accept_greedy
+from ..spec.verify import accept_greedy, accept_rejection
 from ..distributed import (
     IntermediateTensors,
     get_pp_group,
@@ -378,9 +378,34 @@ class ModelRunner:
         if not self.is_driver:
             return _SpecSamples()
 
-        preds = self.model.compute_logits(hidden).argmax(dim=-1).tolist()
-        toks, _accepted = accept_greedy(drafts, preds)
+        logits = self.model.compute_logits(hidden)  # [m, vocab]
+        if self.batch.all_greedy:
+            toks, _accepted = accept_greedy(drafts, logits.argmax(dim=-1).tolist())
+        else:
+            # 温度采样：用**采样器实际使用的分布**（含 top-k/p/min-p 截断）做
+            # 拒绝采样，才能保证输出分布与普通采样逐位一致。
+            toks, _accepted = accept_rejection(
+                drafts, self._verify_probs(logits), None
+            )
         return _SpecSamples(tokens=toks, lens=[len(toks)])
+
+    def _verify_probs(self, logits: torch.Tensor) -> torch.Tensor:
+        """把单序列的采样参数广播到 verify 的 m 个位置，交给 ``Sampler`` 归一化。"""
+        m = logits.shape[0]
+        b = self.batch
+        return self.sampler.final_probs(
+            logits,
+            b.temperatures[:1].expand(m),
+            top_ps=b.top_ps[:1].expand(m),
+            top_ks=b.top_ks[:1].expand(m),
+            min_ps=b.min_ps[:1].expand(m),
+            all_greedy=False,
+            any_greedy=b.any_greedy,
+            use_top_k=b.use_top_k,
+            use_top_p=b.use_top_p,
+            use_min_p=b.use_min_p,
+            max_top_k=b.max_top_k,
+        )
 
     def _prefill_attn(
         self,
