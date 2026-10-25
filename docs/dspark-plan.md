@@ -134,6 +134,55 @@ launch 开销不再被图摊薄——Phase 5 需要按 verify 的节点数分档
 GPU 专属分支；`tests/gpu/test_spec_ngram_e2e.py` 已加 smoke 用例（断言能跑通、
 token 数正确、spec 路径被走到）。
 
+#### 上机复验结果（2026-10-25，Qwen3-0.6B / Qwen3-8B，4090）
+
+**① 0.6B 硬 gate：先失败后确认是测试期望写错，不是引擎错。**
+
+现象：`spec_tokens == base` 不成立（1 failed / 2 passed）。对照诊断发现
+`spec == 同一 rep_prompt 的 baseline` 逐位一致。根因：`rep_prompt = 原 prompt +
+base + base[:12]`，模型会从 `base[12:]` 继续写，所以 spec 本来就不该等于**原始**
+baseline。修法：参照取同一 rep_prompt 的 baseline（`_rep_prompt()` 返回它）。
+> 教训：这类"测试期望取错参照"和真正的实现错误在输出上长得一样，都必须先用
+> 对照实验（同输入 vs 不同输入）区分，不能直接改断言。
+
+**② 8B 上的真实问题：精确并列导致 greedy 分叉。**
+
+现象：`--spec-tokens 4` 下 greedy 一致率仅 28.1%，分叉在第 35 个 token：
+baseline 选 `13`（逗号），spec 选 `382`（句号），而该位置 **top-2 logits 完全相等
+（28.5 / 28.5）**。已排除：运行噪声（baseline 两次一致）、CG（eager 同样分叉）、
+k 大小（k=1/2/4 都在同一位置分叉）、argmax 实现（`compute_logits().argmax` 与
+`ParallelLMHead.argmax` 在 spec 内部 0 次不一致）。
+
+结论：verify 走 paged-varlen prefill（`flash_attn_varlen_func`），baseline decode
+走 `flash_attn_with_kvcache`。**K/V 值是相同的**（由线性层算出，与 attention
+内核无关），但 attention 的归约顺序不同 → logits 有 ~1ulp 差异 → 精确并列处
+argmax 翻转。这是"不同 kernel 的数值路径"问题，不是索引/回滚 bug。
+
+修法（`EngineConfig.spec_tie_eps`，默认 0=关闭）：greedy 下若 **emit 位置**的
+top1−top2 < eps，就把该位置用 **decode 内核**重跑一次（`_run_decode`，与 baseline
+完全同路径，含 CUDA Graph / FP8 KV plan），用它的 argmax 作为输出。代价是 tie
+步多一次 1-token 前向；tie 罕见（128 token 里 1 次）。约束：v1 只支持 `pp_size=1`
+（PP 下 verify 分支各 stage 不对称，追加前向会死锁，已在 config 里显式拒绝）。
+
+> 备选方案与为何不选：① 让 verify 也用 `with_kvcache` 内核——q_len>1 时其
+> tile/split 配置仍与 q_len=1 不同，无法保证逐位一致；② 统一 tie-break
+> （取最小 id）——logits 差 1ulp 时"谁大"已经变了，tie-break 无从生效；
+> ③ 默认关掉 spec——牺牲功能。tie 守卫是唯一能同时保住"逐位一致"和"加速"的。
+
+**③ ngram 在 8B 上没有收益，这是预期的。**
+
+```
+config      ttft_ms  decode_tok/s  e2e_tok/s  peak_GB  accept_rate  accept_len
+spec=0       31.77          59.9       59.5    18.23            —        0.00
+spec=4       29.38          57.1       56.8    18.23         6.5%        1.02
+```
+
+`accept_len = 1.02` 意味着每个验证步只比普通 decode 多产出 0.02 个 token，而
+verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → 净收益 ≈ 0
+（1.049x 在噪声范围内）。**这不是实现问题**：ngram 只在高重复文本上命中，
+6.5% 的接受率注定没有收益。真实收益要等 DSpark（论文报告 accept_len ≈ 2.5~3），
+所以该 bench 目前的定位是**通路验证**，不能当性能论据引用。
+
 ### Phase 3 DSpark 草稿接入（4090）
 
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。

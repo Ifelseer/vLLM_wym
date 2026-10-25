@@ -154,15 +154,49 @@ enable_adaptive_verification               # confidence 调度（仅 dspark）
 
 ---
 
-## 6. 待上机确认（Phase 0 剩余）
+## 6. 上机核实结果（2026-10-25）
 
-1. **checkpoint 是否自带 remote code**：`deepseek-ai/dspark_qwen3_8b_block7` 里是否有
-   `modeling_*.py`。若无 → 必须 vendor DeepSpec 的 `modeling.py`（依赖
-   `transformers.models.qwen3.modeling_qwen3` 的 `Qwen3MLP/Qwen3RMSNorm/Qwen3RotaryEmbedding`）。
-2. **config.json 实际字段**：`block_size` / `target_layer_ids` / `markov_rank` /
-   `mask_token_id` / `vocab_size` 是否与训练配置一致（训练配置不一定等于发布配置）。
-3. **`crop(start)` 的确切语义**：`start` 是「anchor 在序列中的位置」还是「草稿 KV 的已有长度」？
-   需读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB，本次未取）。
-   这决定我们草稿 KV 的追加/回滚规则——**Phase 3 前必须读**。
-4. **vLLM 基线**：4090 上跑 `Qwen3-8B + dspark_qwen3_8b_block7`，记录 acceptance length、
-   decode tok/s、以及与我们树形方案的对照口径。
+### 6.1 已确认
+
+1. **checkpoint 不自带 remote code**：仓库只有 `config.json` + `model.safetensors`（4.5 GB），
+   没有 `modeling_*.py`。→ 必须 **vendor DeepSpec 的 `deepspec/modeling/dspark/`**
+   （`qwen3/modeling.py` 20 KB + `common.py` 9.5 KB + `markov_head.py` 10.9 KB，均为 MIT）。
+2. **实际 config 与训练配置一致**：
+
+   ```
+   architectures: ["Qwen3DSparkModel"]     block_size: 7
+   num_hidden_layers: 5                    num_target_layers: 36
+   target_layer_ids: [1, 9, 17, 25, 33]    mask_token_id: 151669
+   markov_rank: 256                        markov_head_type: vanilla
+   confidence_head_with_markov: true       vocab_size: 151936
+   layer_types: 5 × full_attention         max_window_layers: 36
+   ```
+
+   与 `config/dspark/dspark_qwen3_8b.py` 的训练设置逐项对齐（`num_anchors=512` 是训练期
+   采样参数，推理不涉及，故 config 里没有）。
+
+### 6.2 依赖结论修正
+
+config 里的 `transformers_version: 5.10.2` **不是硬约束**——`Qwen3DSparkModel` 不在
+transformers 里，而是 DeepSpec 仓库的实现；该字段只是"保存时用的版本"。真正的依赖是
+那份 `modeling.py` 引用的 8 个符号：
+
+```
+Qwen3MLP / Qwen3RMSNorm / Qwen3RotaryEmbedding / eager_attention_forward /
+rotate_half / ALL_ATTENTION_FUNCTIONS / GradientCheckpointingLayer / FlashAttentionKwargs
+```
+
+本机（transformers 5.19.0）实测**全部存在**；`transformers.models.qwen3` 自 4.51 起加入，
+所以租机上的 4.57.6 大概率也齐（Phase 3 第一步就是跑一遍符号检查，缺哪个补哪个，不必
+为一个 config 字段去升 torch）。
+
+### 6.3 仍未确认（Phase 3 前必须读代码）
+
+**`crop(start)` 的确切语义**：`start` 是「anchor 在序列中的位置」还是「草稿 KV 的已有
+长度」？需读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB）。
+这决定草稿 KV 的追加/回滚规则。**在读到之前不写草稿 KV 代码**（盲写必错）。
+
+### 6.4 尚未做
+
+**vLLM 同机基线**（acceptance length / decode tok/s）——租机时补一次，作为 Phase 3
+验收的对照口径；目前只有本引擎 baseline（Qwen3-8B greedy 59.9 tok/s）。

@@ -375,19 +375,72 @@ class ModelRunner:
         if not self.is_last_pp:
             self._send_intermediate(hidden)
             return None
-        if not self.is_driver:
-            return _SpecSamples()
 
+        # compute_logits 内含 vocab-parallel 集合通信，必须所有 TP rank 都执行
         logits = self.model.compute_logits(hidden)  # [m, vocab]
+        toks: list[int] = []
+        accepted = 0
         if self.batch.all_greedy:
-            toks, _accepted = accept_greedy(drafts, logits.argmax(dim=-1).tolist())
-        else:
+            toks, accepted = accept_greedy(drafts, logits.argmax(dim=-1).tolist())
+            if self.config.spec_tie_eps > 0.0:
+                # tie 守卫可能追加一次 decode 前向（含集合通信），故也必须在
+                # 所有 rank 上执行；只有 driver 的返回值会被上层使用。
+                toks = self._tie_rerun(s, drafts, logits, accepted, toks)
+        elif self.is_driver:
             # 温度采样：用**采样器实际使用的分布**（含 top-k/p/min-p 截断）做
             # 拒绝采样，才能保证输出分布与普通采样逐位一致。
-            toks, _accepted = accept_rejection(
+            toks, accepted = accept_rejection(
                 drafts, self._verify_probs(logits), None
             )
+
+        if not self.is_driver:
+            return _SpecSamples()
         return _SpecSamples(tokens=toks, lens=[len(toks)])
+
+    def _tie_rerun(
+        self,
+        s: SeqSchedule,
+        drafts: list[int],
+        logits: torch.Tensor,
+        accepted: int,
+        toks: list[int],
+    ) -> list[int]:
+        """greedy tie 守卫：在精确并列处改用 **decode 内核**重算 emit 位置。
+
+        背景：verify 走 paged-varlen prefill（``flash_attn_varlen_func``），
+        baseline decode 走 ``flash_attn_with_kvcache``。两者 K/V 完全相同，但
+        attention 的归约顺序不同，logits 会有 ~1ulp 级差异。目标分布出现精确
+        并列（实测 Qwen3-8B 某位置 top1 == top2 == 28.5）时，argmax 就会翻到
+        另一个 token，导致"无损"失败。
+
+        修法：把该位置重新按 decode 通路跑一次（`_run_decode`，与 baseline 完全
+        同路径，含 CUDA Graph / FP8 KV plan），用它的 argmax 作为 emit token。
+        只多一次 1-token 前向，且只在 tie 步发生。
+        """
+        top2 = logits[accepted].topk(2).values
+        if float(top2[0] - top2[1]) >= self.config.spec_tie_eps:
+            return toks
+
+        pos = s.num_cached_tokens + accepted
+        block_tokens = [s.token_ids[-1]] + list(drafts)
+        vseq = SeqSchedule(
+            seq_id=s.seq_id,
+            block_table=s.block_table,
+            num_cached_tokens=pos,
+            token_ids=[block_tokens[accepted]],
+            need_sample=False,
+            temperature=s.temperature,
+            top_p=s.top_p,
+            top_k=s.top_k,
+            min_p=s.min_p,
+        )
+        # 注意：这里会重写位置 pos 的 KV——K/V 由线性层算出，与 attention 内核
+        # 无关，所以写入的值与 verify 那次完全相同，只是用 decode 内核重新
+        # 计算了 logits。
+        out = self._run_decode([vseq])
+        if out is None:  # 非 driver rank：只为参与集合通信，结果不使用
+            return toks
+        return toks[:accepted] + [int(out[0])]
 
     def _verify_probs(self, logits: torch.Tensor) -> torch.Tensor:
         """把单序列的采样参数广播到 verify 的 m 个位置，交给 ``Sampler`` 归一化。"""

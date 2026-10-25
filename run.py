@@ -70,6 +70,7 @@ DEFAULTS = {
     "quant_kv_cache": False,
     "spec_tokens": 0,
     "spec_draft": "ngram",
+    "spec_tie_eps": 0.0,
 }
 
 
@@ -107,6 +108,7 @@ def _make_engine(cfg: dict) -> Engine:
             quant_kv_cache=bool(cfg.get("quant_kv_cache", False)),
             spec_tokens=int(cfg.get("spec_tokens", 0)),
             spec_draft=cfg.get("spec_draft", "ngram"),
+            spec_tie_eps=float(cfg.get("spec_tie_eps", 0.0)),
         )
     )
 
@@ -278,6 +280,14 @@ def main() -> None:
         help="草稿来源：ngram=后缀匹配（无模型）/ dspark=DSpark 草稿头（Phase 3）",
     )
     p.add_argument(
+        "--spec-tie-eps",
+        type=float,
+        default=None,
+        help="greedy tie 守卫阈值（0=关闭）。verify 与 decode 用不同 attention "
+        "内核，精确并列处 argmax 可能翻转；>0 时在 top1-top2 < eps 的位置用 "
+        "decode 内核重算，保证与 baseline 逐位一致",
+    )
+    p.add_argument(
         "--pp-layer-counts",
         type=str,
         default=None,
@@ -340,6 +350,8 @@ def main() -> None:
         cfg["spec_tokens"] = args.spec_tokens
     if args.spec_draft is not None:
         cfg["spec_draft"] = args.spec_draft
+    if args.spec_tie_eps is not None:
+        cfg["spec_tie_eps"] = args.spec_tie_eps
 
     if args.batch:
         run_batch(cfg)

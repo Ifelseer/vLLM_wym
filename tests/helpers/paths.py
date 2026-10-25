@@ -17,6 +17,7 @@ def _model(*candidates: Path) -> Path:
 
 
 DENSE_MODEL = _model(HF_HOME / "Qwen3-0.6B")
+DENSE_8B = _model(HF_HOME / "Qwen3-8B")
 MOE_MODEL = _model(
     HF_HOME / "Qwen1.5-MoE-A2.7B",
     HF_HOME / "Qwen1.5-MoE-A2.7B-Chat",
