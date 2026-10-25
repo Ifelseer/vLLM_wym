@@ -43,13 +43,9 @@ class Scheduler:
         # --- 投机解码 ---
         self.spec_tokens = max(0, spec_tokens)
         self.max_seq_len = max(0, max_seq_len or 0)
-        if self.spec_tokens > 0 and max_num_seqs > 1:
-            # v1 限制：verify 路径按单序列实现（树形验证需要每序列一棵树，
-            # 且要按序列拼平 cu_seqlens，留到 v2）。
-            raise ValueError(
-                "speculative decoding (spec_tokens > 0) requires "
-                f"max_num_seqs == 1 in v1, got {max_num_seqs}"
-            )
+        # 多序列：verify 把每条序列的 [anchor + drafts] 按 cu_seqlens 拼平做一次
+        # 前向，落账逐序列进行（d_lens）。注意 verify 的 CUDA Graph 只在 bs==1
+        # 生效（多序列的 (bs, 每序列 m) 组合数爆炸），bs>1 回退 eager。
         if self.spec_tokens <= 0:
             self.drafter: Drafter | None = None
         elif drafter is not None:

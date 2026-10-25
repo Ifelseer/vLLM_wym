@@ -61,8 +61,11 @@ class ModelRunner:
         self._aux_buf: torch.Tensor | None = None
         # DSpark 草稿器（懒加载草稿模型）与每个序列的待追加 context 段
         self._dspark = None
+        # 重算路径防重入：spec_exact_kv/tie 守卫里的普通 decode 不能被再拦成 verify
+        self._suppress_spec = False
         self._dspark_pending: dict[int, torch.Tensor] = {}
-        self._draft_probs: torch.Tensor | None = None
+        # 每序列的草稿分布（长度 = bs；None 表示该序列是确定性草稿）
+        self._draft_probs: list[torch.Tensor | None] = []
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -419,9 +422,15 @@ class ModelRunner:
     def _run_decode(self, seqs: list[SeqSchedule]):
         if not seqs:
             return None
-        if self.config.spec_tokens > 0 and self.config.spec_draft == "dspark":
+        if (
+            self.config.spec_tokens > 0
+            and self.config.spec_draft == "dspark"
+            and not self._suppress_spec
+        ):
             # DSpark 每步都走 verify（eager 的 prefill 通路）：草稿需要它产出的
             # aux hidden，同时这条路径完全不进 decode CUDA Graph。
+            # `_suppress_spec`：bit-exact 的逐位置重算要走**普通 decode**，
+            # 否则会重新进入 verify → 无限递归。
             return self._run_verify(seqs, drafts=self._propose_dspark(seqs))
         if self.config.spec_tokens > 0 and any(s.draft_ids for s in seqs):
             return self._run_verify(seqs)
@@ -519,22 +528,25 @@ class ModelRunner:
             self._dspark = DSparkDrafter(draft, device=self.device)
         return self._dspark
 
-    def _propose_dspark(self, seqs: list[SeqSchedule]) -> list[int]:
-        """worker 侧起草：用上一步验证出的 context 段 + anchor 出 k 个候选。"""
+    def _propose_dspark(self, seqs: list[SeqSchedule]) -> list[list[int]]:
+        """worker 侧起草：逐序列出 ≤k 个候选（每序列一个草稿 KV，互不影响）。"""
         dr = self._ensure_dspark()
-        if dr is None or len(seqs) != 1:
-            return []
-        s = seqs[0]
-        first = self._dspark_pending.pop(s.seq_id, None)
-        self._draft_probs = None
-        tokens, probs = dr.propose(
-            s.seq_id,
-            anchor_token_id=s.token_ids[-1],
-            start=s.num_cached_tokens,
-            first_ctx=first,
-        )
-        self._draft_probs = probs
-        return tokens
+        if dr is None:
+            return [[] for _ in seqs]
+        out: list[list[int]] = []
+        probs_all: list[torch.Tensor | None] = []
+        for s in seqs:
+            first = self._dspark_pending.pop(s.seq_id, None)
+            tokens, probs = dr.propose(
+                s.seq_id,
+                anchor_token_id=s.token_ids[-1],
+                start=s.num_cached_tokens,
+                first_ctx=first,
+            )
+            out.append(tokens)
+            probs_all.append(probs)
+        self._draft_probs = probs_all
+        return out
 
     @torch.inference_mode()
     def _run_verify(
@@ -555,50 +567,57 @@ class ModelRunner:
         决策（决定 KV 账本），无法像普通 decode 那样只把 id 异步 D2H；v1 每次
         只读 ≤8 个整数，开销可忽略，Phase 5 再考虑把裁决整体搬到 GPU。
         """
-        assert len(seqs) == 1, "v1 speculative decode supports a single sequence"
-        s = seqs[0]
-        drafts = list(s.draft_ids if drafts is None else drafts)
-        m = 1 + len(drafts)
+        n = len(seqs)
+        per: list[tuple[SeqSchedule, list[int]]] = []
+        for i, s in enumerate(seqs):
+            d = list(s.draft_ids) if drafts is None else list(drafts[i])
+            per.append((s, d))
+        ms = [1 + len(d) for _, d in per]
+        n_tokens = sum(ms)
 
-        vseq = SeqSchedule(
-            seq_id=s.seq_id,
-            block_table=s.block_table,
-            num_cached_tokens=s.num_cached_tokens,
-            token_ids=[s.token_ids[-1]] + drafts,
-            need_sample=False,
-            temperature=s.temperature,
-            top_p=s.top_p,
-            top_k=s.top_k,
-            min_p=s.min_p,
-        )
-        n_tokens, max_q, max_k, has_cache = self.batch.build_prefill([vseq])
-        assert n_tokens == m, f"verify built {n_tokens} tokens, expected {m}"
+        vseqs = [
+            SeqSchedule(
+                seq_id=s.seq_id,
+                block_table=s.block_table,
+                num_cached_tokens=s.num_cached_tokens,
+                token_ids=[s.token_ids[-1]] + d,
+                need_sample=False,
+                temperature=s.temperature,
+                top_p=s.top_p,
+                top_k=s.top_k,
+                min_p=s.min_p,
+            )
+            for s, d in per
+        ]
+        built, max_q, max_k, has_cache = self.batch.build_prefill(vseqs)
+        assert built == n_tokens, f"verify built {built} tokens, expected {n_tokens}"
         if self._fp8_kv is not None and has_cache:
             self._fp8_kv.plan_prefill(
-                self.batch.cu_seqlens_q[:2],
-                self.batch.cu_seqlens_k[:2],
-                self.batch.block_tables[:1],
+                self.batch.cu_seqlens_q[: n + 1],
+                self.batch.cu_seqlens_k[: n + 1],
+                self.batch.block_tables[:n],
             )
-        # 选最紧的桶：桶按升序，第一个装得下的就是最优（多余 tile 会早退）
+        # 图只用单序列：多序列的组合是 (bs, 每序列 m)，可能性爆炸；v1 回退 eager。
         graph = None
-        need = s.num_cached_tokens + m
-        for bound in self._verify_buckets:
-            cand = self._verify_graphs.get((m, bound))
-            if cand is not None and need <= bound:
-                graph = cand
-                break
+        if n == 1:
+            need = per[0][0].num_cached_tokens + ms[0]
+            for bound in self._verify_buckets:
+                cand = self._verify_graphs.get((ms[0], bound))
+                if cand is not None and need <= bound:
+                    graph = cand
+                    break
         if graph is not None:
             # 录图口径：build_prefill 已把 input_ids/positions/slot_mapping/
             # cu_seqlens 写进静态 GPU 缓冲，replay 只跑模型前向
             graph.replay()
-            hidden = self._verify_out[:m]
+            hidden = self._verify_out[:n_tokens]
         else:
             it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
             with attention_context(self._meta):
                 hidden = self.model(
                     self.batch.input_ids[:n_tokens],
                     self.batch.positions[:n_tokens],
-                    self._prefill_attn(1, n_tokens, max_q, max_k, has_cache),
+                    self._prefill_attn(n, n_tokens, max_q, max_k, has_cache),
                     it,
                     self._ensure_aux(n_tokens),
                 )
@@ -607,44 +626,51 @@ class ModelRunner:
             return None
 
         # compute_logits 内含 vocab-parallel 集合通信，必须所有 TP rank 都执行
-        logits = self.model.compute_logits(hidden)  # [m, vocab]
-        toks: list[int] = []
-        accepted = 0
-        if self.batch.all_greedy:
-            toks, accepted = accept_greedy(drafts, logits.argmax(dim=-1).tolist())
-            if self.config.spec_exact_kv:
-                # bit-exact：逐个位置用 decode 内核重写 KV（含集合通信，必须在
-                # 所有 rank 上执行；只有 driver 的返回值会被上层使用）
-                toks = self._kv_exact_rerun(s, drafts, accepted, toks)
-            elif self.config.spec_tie_eps > 0.0:
-                toks = self._tie_rerun(s, drafts, logits, accepted, toks)
-        elif self.is_driver:
-            # 温度采样：用**采样器实际使用的分布**（含 top-k/p/min-p 截断）做
-            # 拒绝采样，才能保证输出分布与普通采样逐位一致。
-            draft_probs = self._draft_probs
-            if draft_probs is not None and draft_probs.shape[0] != len(drafts):
-                draft_probs = None  # 草稿被截断 → 退回 one-hot 语义
-            toks, accepted = accept_rejection(
-                drafts, self._verify_probs(logits), draft_probs
-            )
-
-        if self._dspark is not None and self._aux_buf is not None and self.is_driver:
-            # 草稿侧账本：本次验证通过的位置 p..p+accepted 的 hidden 就是下一步
-            # 要追加的 context 段（上游 `_update` 同款，取 [:accepted+1]）
-            self._dspark.update(
-                s.seq_id,
-                self._aux_buf[: accepted + 1].clone().unsqueeze(0),
-                start=s.num_cached_tokens + 1 + accepted,
-            )
-        self._draft_probs = None
+        logits = self.model.compute_logits(hidden)  # [n_tokens, vocab]
+        toks_all: list[int] = []
+        lens: list[int] = []
+        off = 0
+        for i, (s, d) in enumerate(per):
+            m = ms[i]
+            rows = logits[off : off + m]
+            if self.batch.all_greedy:
+                toks, accepted = accept_greedy(d, rows.argmax(dim=-1).tolist())
+                if self.config.spec_exact_kv:
+                    # bit-exact：逐位置用 decode 内核重写 KV（含集合通信）
+                    toks = self._kv_exact_rerun(s, d, accepted, toks)
+                elif self.config.spec_tie_eps > 0.0:
+                    toks = self._tie_rerun(s, d, rows, accepted, toks)
+            elif self.is_driver:
+                # 温度采样：用**采样器实际使用的分布**做拒绝采样
+                dp = None
+                if self._draft_probs:
+                    cand = self._draft_probs[i]
+                    if cand is not None and cand.shape[0] == len(d):
+                        dp = cand
+                toks, accepted = accept_rejection(
+                    d, self._verify_probs(rows, i), dp
+                )
+            else:
+                toks, accepted = [], 0
+            if self._dspark is not None and self._aux_buf is not None and self.is_driver:
+                # 草稿侧账本：本序列验证通过的位置的 hidden 是下一步的 context 段
+                self._dspark.update(
+                    s.seq_id,
+                    self._aux_buf[off : off + accepted + 1].clone().unsqueeze(0),
+                    start=s.num_cached_tokens + 1 + accepted,
+                )
+            toks_all.extend(toks)
+            lens.append(len(toks))
+            off += m
+        self._draft_probs = []
 
         if not self.is_driver:
             return _SpecSamples()
         return _SpecSamples(
-            tokens=toks,
-            lens=[len(toks)],
+            tokens=toks_all,
+            lens=lens,
             # worker 侧起草（dspark）时，调度器不知道提了几个，必须回传
-            proposed=[len(drafts)] if self._dspark is not None else [],
+            proposed=[len(d) for _, d in per] if self._dspark is not None else [],
         )
 
     def _kv_exact_rerun(
@@ -685,7 +711,12 @@ class ModelRunner:
                 top_k=s.top_k,
                 min_p=s.min_p,
             )
-            out = self._run_decode([vseq])
+            # 同上：压掉 spec 分支，走普通 decode 内核
+            self._suppress_spec = True
+            try:
+                out = self._run_decode([vseq])
+            finally:
+                self._suppress_spec = False
             if out is not None:
                 token = int(out[0])
         if token is None:  # 非 driver rank：只为参与集合通信
@@ -736,21 +767,30 @@ class ModelRunner:
         # 注意：这里会重写位置 pos 的 KV——K/V 由线性层算出，与 attention 内核
         # 无关，所以写入的值与 verify 那次完全相同，只是用 decode 内核重新
         # 计算了 logits。
-        out = self._run_decode([vseq])
+        # 走**普通 decode**：临时压掉 spec 分支，否则会重新进入 verify（无限递归）
+        self._suppress_spec = True
+        try:
+            out = self._run_decode([vseq])
+        finally:
+            self._suppress_spec = False
         if out is None:  # 非 driver rank：只为参与集合通信，结果不使用
             return toks
         return toks[:accepted] + [int(out[0])]
 
-    def _verify_probs(self, logits: torch.Tensor) -> torch.Tensor:
-        """把单序列的采样参数广播到 verify 的 m 个位置，交给 ``Sampler`` 归一化。"""
+    def _verify_probs(self, logits: torch.Tensor, i: int = 0) -> torch.Tensor:
+        """把第 ``i`` 条序列的采样参数广播到它的 m 个位置，交给 ``Sampler`` 归一化。
+
+        ``build_prefill`` 的采样参数是**按序列**（batch 行）排的，而 verify 的
+        logits 是按 token 排的，所以要用序列下标取参数再 broadcast。
+        """
         m = logits.shape[0]
         b = self.batch
         return self.sampler.final_probs(
             logits,
-            b.temperatures[:1].expand(m),
-            top_ps=b.top_ps[:1].expand(m),
-            top_ks=b.top_ks[:1].expand(m),
-            min_ps=b.min_ps[:1].expand(m),
+            b.temperatures[i : i + 1].expand(m),
+            top_ps=b.top_ps[i : i + 1].expand(m),
+            top_ks=b.top_ks[i : i + 1].expand(m),
+            min_ps=b.min_ps[i : i + 1].expand(m),
             all_greedy=False,
             any_greedy=b.any_greedy,
             use_top_k=b.use_top_k,

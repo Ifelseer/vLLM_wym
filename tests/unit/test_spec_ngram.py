@@ -184,16 +184,26 @@ def _scheduler(*, spec_tokens: int = 4, max_seq_len: int = 0,
 
 
 class TestSchedulerSpec:
-    def test_requires_single_sequence(self):
-        kv = KVManager(num_blocks=8, block_size=BLOCK, prefix_backend="none")
-        with pytest.raises(ValueError, match="max_num_seqs == 1"):
-            Scheduler(
-                kv,
-                max_num_seqs=4,
-                max_num_batched_tokens=64,
-                eos_token_id=2,
-                spec_tokens=4,
-            )
+    def test_multi_sequence_supported(self):
+        """batch>1 已支持：构造不再报错，且每序列预留 1+k 个位置。"""
+
+        class _FixedDrafter:
+            def propose(self, seq, k: int) -> list[int]:  # noqa: ARG002
+                return [7] * k
+
+        kv = KVManager(num_blocks=64, block_size=BLOCK, prefix_backend="none")
+        s = Scheduler(
+            kv,
+            max_num_seqs=3,
+            max_num_batched_tokens=256,
+            eos_token_id=2,
+            spec_tokens=4,
+            drafter=_FixedDrafter(),
+        )
+        seq = _seq(list(range(5)), cached=4)
+        drafts, write = s._propose(seq, 0)
+        assert drafts == [7] * 4
+        assert write == 1 + len(drafts) == 5, "每序列写 1+k 个位置"
 
     def test_propose_respects_context_limit(self):
         s = _scheduler(max_seq_len=8)

@@ -89,6 +89,25 @@
 launch 开销不再被图摊薄——Phase 5 需要按 verify 的节点数分档录图，否则小模型上可能
 "接受了草稿但总吞吐反而下降"。树形验证尚未接入（Phase 4）。
 
+**batch>1 已支持（2026-10-25）**：verify 把每条序列的 `[anchor + drafts]` 按
+`cu_seqlens` 拼平做一次前向，落账逐序列（`d_lens`）进行。三处改动：
+
+1. `_run_verify` 去掉单序列假设，逐序列切片裁决（`ms[i]` 累加得偏移）、逐序列
+   更新草稿 context（`aux[off : off+accepted+1]`）；
+2. `_propose_dspark` 返回 `list[list[int]]`（每序列一份草稿），`_draft_probs` 变
+   成 per-seq 列表；
+3. `_verify_probs(logits, i)` 按序列取采样参数（原来固定取第 0 条，多序列下会用
+   错温度）。
+
+**已知代价**：verify 图只在 `bs == 1` 生效——多序列的组合是 `(bs, 每序列 m)`，
+可能性爆炸；`bs>1` 回退 eager。要补的话方向是"强制每序列同 m（都提出 k 个）+
+只按 bs 分档"。
+
+**顺带修掉一个递归 bug**：`spec_exact_kv` / `_tie_rerun` 内部要跑一次普通 decode，
+而 dspark 模式下 `_run_decode` 会无条件转成 verify → 无限递归。加 `_suppress_spec`
+标志后走真正的普通 decode。（这个组合此前只有 ngram 跑过，dspark + exact_kv 的
+GPU 测试还没执行过，属于"写好了但没验证"的路径。）
+
 **第三条限制（上机后才明确）**：greedy 的"逐位一致"默认**不成立**——verify 与
 decode 用不同 attention 内核，cache 里的 KV 有 ~1ulp 差异，精确并列处会翻转。
 需要保证时开 `spec_exact_kv`（逐位置用 decode 内核重写 KV，实测 8B n=128 完全

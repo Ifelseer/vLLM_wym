@@ -150,13 +150,8 @@ class EngineConfig:
         if self.spec_tokens < 0:
             raise ValueError(f"spec_tokens must be >= 0, got {self.spec_tokens}")
         if self.spec_tokens > 0:
-            # v1 限制：verify 是单序列路径（树形验证需要每序列一棵树 + 拼平
-            # cu_seqlens），多序列留到 v2。显式报错好过静默忽略。
-            if self.max_num_seqs != 1:
-                raise ValueError(
-                    "spec_tokens > 0 requires max_num_seqs == 1 in v1, "
-                    f"got max_num_seqs={self.max_num_seqs}"
-                )
+            # 多序列已支持：verify 按 cu_seqlens 拼平一次前向，落账逐序列。
+            # 已知代价：verify 图只在 bs==1 生效，bs>1 回退 eager。
             if self.spec_draft not in ("ngram", "dspark"):
                 raise ValueError(
                     f"spec_draft must be ngram|dspark, got {self.spec_draft!r}"
