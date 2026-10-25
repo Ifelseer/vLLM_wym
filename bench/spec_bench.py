@@ -62,6 +62,7 @@ def _run_one(
     cg: bool,
     tie_eps: float = 0.0,
     exact_kv: bool = False,
+    draft_model: str = "",
 ) -> dict:
     import torch
 
@@ -81,6 +82,7 @@ def _run_one(
             spec_draft=spec_draft,  # type: ignore[arg-type]
             spec_tie_eps=tie_eps,
             spec_exact_kv=exact_kv,
+            spec_draft_model=draft_model,
         )
     )
     try:
@@ -151,6 +153,9 @@ def main() -> None:
     p.add_argument("--prompt-file", default="", help="从文件读 prompt（覆盖 --prompt）")
     p.add_argument("--spec-tokens", type=int, default=4, help="草稿长度 k")
     p.add_argument("--spec-draft", default="ngram", choices=("ngram", "dspark"))
+    p.add_argument(
+        "--spec-draft-model", default="", help="DSpark 草稿目录（--spec-draft dspark 必填）"
+    )
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--n", type=int, default=64)
     p.add_argument("--warmup", type=int, default=2)
@@ -194,6 +199,7 @@ def main() -> None:
         spec_draft=args.spec_draft,
         tie_eps=args.spec_tie_eps,
         exact_kv=args.spec_exact_kv,
+        draft_model=args.spec_draft_model,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
     # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
