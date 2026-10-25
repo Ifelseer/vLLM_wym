@@ -33,12 +33,23 @@ _PROMPT = "List the first ten prime numbers, separated by commas: 2, 3, 5, 7,"
 
 
 def _run(
-    prompt: str | list[int], *, spec: int, n: int = _N, tie_eps: float = 0.0,
+    prompt: str | list[int],
+    *,
+    spec: int,
+    n: int = _N,
+    tie_eps: float = 0.0,
+    exact_kv: bool = False,
     model=DENSE_MODEL,
 ):
     """返回 (prompt_ids, 生成的 token, 调度器投机统计)。"""
     with engine_session(
-        cfg(model, max_num_seqs=1, spec_tokens=spec, spec_tie_eps=tie_eps)
+        cfg(
+            model,
+            max_num_seqs=1,
+            spec_tokens=spec,
+            spec_tie_eps=tie_eps,
+            spec_exact_kv=exact_kv,
+        )
     ) as eng:
         seq = eng.add_request(
             prompt,
@@ -80,22 +91,30 @@ def test_spec_greedy_matches_baseline():
 
 
 @require_model(DENSE_8B)
-def test_spec_greedy_matches_baseline_8b_tie_guard():
-    """8B 上必须开 tie 守卫才能逐位一致（0.6B 不需要，但开着也无害）。
+def test_spec_greedy_matches_baseline_8b_exact_kv():
+    """8B 长序列（n=128）：只有 bit-exact 模式能保证逐位一致。
 
-    8B 实测：某位置 top1 == top2（28.5 / 28.5），verify 的 paged-varlen 与
-    baseline 的 ``flash_attn_with_kvcache`` 归约顺序不同，~1ulp 差异把逗号
-    翻成句号——开 ``spec_tie_eps`` 后由 decode 内核重算该位置即可对齐。
+    为什么不用 ``spec_tie_eps``（emit 位置守卫）：它只在"emit 位置本身并列"时
+    生效。8B 实测的分叉发生在 verify 之后的**普通 decode** 步（第 45 个 token），
+    因为 verify 写进 cache 的 anchor/accepted K/V 也带 ~1ulp 差异（K/V 的输入
+    hidden 由 attention 算出），后续 decode 读到这份 KV 才翻转——守卫完全不触发。
+
+    ``spec_exact_kv`` 把每步的 anchor + accepted 逐个用 decode 内核重写 KV 后，
+    8B 上 base == spec（实测 first_diff = None）。代价是每步多 accepted+1 次
+    1-token 前向，属于校验/参考模式。
     """
-    rep, base_rep = _rep_prompt(model=DENSE_8B)
+    n = 128
+    prompt_ids, base, _ = _run(_PROMPT, spec=0, n=n, model=DENSE_8B)
+    rep = prompt_ids + base + base[: n // 2]
+    _, base_rep, _ = _run(rep, spec=0, n=n, model=DENSE_8B)
 
     _, spec_tokens, stats = _run(
-        rep, spec=_SPEC_K, n=_N, tie_eps=0.01, model=DENSE_8B
+        rep, spec=_SPEC_K, n=n, exact_kv=True, model=DENSE_8B
     )
     assert stats["proposed"] > 0 and stats["accepted"] > 0
     assert spec_tokens == base_rep, (
-        "8B greedy mismatch even with tie guard "
-        f"(eps=0.01)\nbase={base_rep}\nspec={spec_tokens}"
+        "8B greedy mismatch even with spec_exact_kv\n"
+        f"base={base_rep}\nspec={spec_tokens}"
     )
 
 

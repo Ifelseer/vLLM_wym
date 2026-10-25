@@ -85,6 +85,17 @@ class EngineConfig:
     # **decode 内核**重算该位置（与 baseline 完全同路径），保证 greedy 逐位一致。
     # 代价：只在 tie 步多一次 1-token 前向（罕见）。
     spec_tie_eps: float = 0.0
+    # bit-exact 模式（默认关）：verify 之后，把 anchor 与 accepted 草稿的 KV
+    # 逐个用 **decode 内核**重写一遍（每步多 accepted+1 次 1-token 前向），
+    # 使 cache 里每个位置都由与 baseline 相同的内核写入，从而 greedy 逐位一致。
+    #
+    # 为什么需要它：位置 q 的 K/V = k_proj(norm(h_q))，而 h_q 是上一层 attention
+    # 的输出——verify（paged-varlen）与 decode（with_kvcache）的归约顺序不同，
+    # h_q 差 ~1ulp，写进 cache 的 K/V 也就不同；后续普通 decode 读到这份 KV，
+    # 在精确并列处就会翻转（8B 实测第 45 个 token）。
+    # 定位是**校验/参考模式**（可证明无损），不是性能模式：accept_len 低时
+    # 额外前向会把收益吃光。
+    spec_exact_kv: bool = False
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
@@ -130,13 +141,17 @@ class EngineConfig:
                 )
         if self.spec_tie_eps < 0:
             raise ValueError(f"spec_tie_eps must be >= 0, got {self.spec_tie_eps}")
-        if self.spec_tie_eps > 0:
-            # tie 守卫要在 verify 之后追加一次 decode 前向；PP 下各 stage 的
-            # verify 分支不对称（非末段提前 send），会死锁。v1 只支持 pp=1。
+        if self.spec_tie_eps > 0 or self.spec_exact_kv:
+            # 守卫/exact 模式都要在 verify 之后追加 decode 前向；PP 下各 stage
+            # 的 verify 分支不对称（非末段提前 send），会死锁。v1 只支持 pp=1。
             if self.pp_size > 1:
-                raise ValueError("spec_tie_eps > 0 requires pp_size == 1 in v1")
+                raise ValueError(
+                    "spec_tie_eps / spec_exact_kv require pp_size == 1 in v1"
+                )
             if self.spec_tokens <= 0:
-                raise ValueError("spec_tie_eps > 0 requires spec_tokens > 0")
+                raise ValueError(
+                    "spec_tie_eps / spec_exact_kv require spec_tokens > 0"
+                )
         self.hf_config = AutoConfig.from_pretrained(self.model, trust_remote_code=True)
         self.is_moe = _is_moe_config(self.hf_config)
         self.quant_config = self._resolve_quant()

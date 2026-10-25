@@ -86,8 +86,23 @@ PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-0.6B-FP8 \
 
 `spec_bench.py` 额外输出 `accept_rate`（草稿被接受比例）与 `accept_len`
 （每验证步平均产出 token 数，上限 `k+1`）。**口径纪律**：`--temperature 0`
-下 `greedy 逐 token 一致率` 必须 100%——投机解码是无损加速，任何分叉都是
-verify/KV 回滚的 bug，不是精度差异。
+下 `greedy 逐 token 一致率` 必须 100%——投机解码是无损加速。
+
+不过"100%"需要开对应开关才成立（verify 与 decode 用不同 attention 内核，cache
+里的 KV 有 ~1ulp 差异，精确并列处会翻转）：
+
+```bash
+# bit-exact 参考模式：逐位置用 decode 内核重写 KV（8B n=128 实测完全对齐）
+PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-8B \
+    --spec-tokens 4 --spec-exact-kv --cg --n 128 --json exact.json
+
+# 便宜的部分守卫：只在 emit 位置近并列时重算（长序列仍可能分叉）
+PYTHONPATH=. python bench/spec_bench.py --model ~/huggingface/Qwen3-8B \
+    --spec-tokens 4 --spec-tie-eps 0.01 --cg --n 128
+```
+
+`--spec-exact-kv` 每步多 `accepted+1` 次 1-token 前向，是**校验/参考模式**，
+不是性能模式；追吞吐时用它测一致性、用不带开关的跑性能，两者分别报数。
 
 v1 的 verify 是单序列实现，脚本固定 `max_num_seqs=1`；多序列（每序列一棵树）
 留到 v2，见 [docs/dspark-plan.md](../docs/dspark-plan.md)。

@@ -89,6 +89,12 @@
 launch 开销不再被图摊薄——Phase 5 需要按 verify 的节点数分档录图，否则小模型上可能
 "接受了草稿但总吞吐反而下降"。树形验证尚未接入（Phase 4）。
 
+**第三条限制（上机后才明确）**：greedy 的"逐位一致"默认**不成立**——verify 与
+decode 用不同 attention 内核，cache 里的 KV 有 ~1ulp 差异，精确并列处会翻转。
+需要保证时开 `spec_exact_kv`（逐位置用 decode 内核重写 KV，实测 8B n=128 完全
+对齐），代价是每步多 `accepted+1` 次前向。因此对外表述应为：
+**快路径在非并列位置与 baseline 一致；`spec_exact_kv` 下逐位一致**。
+
 ### Phase 2 温度采样 + 拒绝采样
 
 改动：`Sampler.logprobs()`（`log_softmax`）、verify 时禁用 `argmax` 捷径、标准拒绝采样（接受 `min(1, p_t/p_d)`、拒绝时从 `max(0, p_t−p_d)` 归一化后采样、全接受则采 bonus）。
@@ -154,20 +160,35 @@ k 大小（k=1/2/4 都在同一位置分叉）、argmax 实现（`compute_logits
 `ParallelLMHead.argmax` 在 spec 内部 0 次不一致）。
 
 结论：verify 走 paged-varlen prefill（`flash_attn_varlen_func`），baseline decode
-走 `flash_attn_with_kvcache`。**K/V 值是相同的**（由线性层算出，与 attention
-内核无关），但 attention 的归约顺序不同 → logits 有 ~1ulp 差异 → 精确并列处
-argmax 翻转。这是"不同 kernel 的数值路径"问题，不是索引/回滚 bug。
+走 `flash_attn_with_kvcache`，attention 归约顺序不同 → logits 差 ~1ulp → 精确并列
+处 argmax 翻转。
 
-修法（`EngineConfig.spec_tie_eps`，默认 0=关闭）：greedy 下若 **emit 位置**的
-top1−top2 < eps，就把该位置用 **decode 内核**重跑一次（`_run_decode`，与 baseline
-完全同路径，含 CUDA Graph / FP8 KV plan），用它的 argmax 作为输出。代价是 tie
-步多一次 1-token 前向；tie 罕见（128 token 里 1 次）。约束：v1 只支持 `pp_size=1`
-（PP 下 verify 分支各 stage 不对称，追加前向会死锁，已在 config 里显式拒绝）。
+**第二次修正（原判断不完整）**：最初写的是"K/V 值相同、与内核无关"——**错**。
+位置 q 的 K/V 是 `k_proj(norm(h_q))`，而 `h_q` 是**上一层 attention 的输出**。
+verify 用 varlen 算出的 `h_q` 与 decode 用 `with_kvcache` 算的差 ~1ulp，写进
+cache 的 K/V 也就不同。实测证据：分叉发生在 **verify 之后的普通 decode 步**
+（p=45），而 verify 各次 emit 位置的 top1−top2 全都 > 0.1（最小 12.75）。
+所以：
 
-> 备选方案与为何不选：① 让 verify 也用 `with_kvcache` 内核——q_len>1 时其
-> tile/split 配置仍与 q_len=1 不同，无法保证逐位一致；② 统一 tie-break
-> （取最小 id）——logits 差 1ulp 时"谁大"已经变了，tie-break 无从生效；
-> ③ 默认关掉 spec——牺牲功能。tie 守卫是唯一能同时保住"逐位一致"和"加速"的。
+- 只重算 emit 位置（`spec_tie_eps`）→ **只能覆盖一部分**，长序列仍分叉；
+- 要逐位一致，必须让 cache 里**每个位置**都由 decode 内核写入。
+
+两级机制（互斥，前者优先）：
+
+| 开关 | 做什么 | 保证 | 代价 |
+|---|---|---|---|
+| `spec_tie_eps`（默认 0） | emit 位置 top1−top2 < eps 时，用 decode 内核重算该位置 | ❌ 部分（只覆盖 emit 处并列） | tie 步 +1 次前向 |
+| `spec_exact_kv`（默认关） | 每步把 anchor + accepted 逐个用 decode 内核重写 KV，用最后一次 argmax 作输出 | ✅ 实测 8B n=128 `first_diff=None` | 每步 +(`accepted+1`) 次前向 |
+
+`spec_exact_kv` 的定位是**校验/参考模式**：`accept_len=1.02` 时每步要 2 次前向，
+收益被吃光；只有 `accept_len` 高（DSpark 预期 2.5~3）时才勉强可接受。生产默认
+仍用快路径 + 承认"精确并列处可能与 baseline 不同"。
+
+> 备选方案与为何不选：① 让 verify 也用 `with_kvcache`——q_len>1 时 tile/split
+> 配置仍与 q_len=1 不同，仍无法逐位一致；② 统一 tie-break（取最小 id）——
+> logits 差 1ulp 时"谁大"已经变了，tie-break 无从生效；③ 默认关 spec——牺牲功能。
+> 约束：两个模式都要求 `pp_size == 1`（PP 下 verify 各 stage 分支不对称，追加前向
+> 会死锁，已在 config 显式拒绝）。
 
 **③ ngram 在 8B 上没有收益，这是预期的。**
 

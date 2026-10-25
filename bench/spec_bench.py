@@ -60,6 +60,8 @@ def _run_one(
     tp: int,
     quantization: str,
     cg: bool,
+    tie_eps: float = 0.0,
+    exact_kv: bool = False,
 ) -> dict:
     import torch
 
@@ -77,6 +79,8 @@ def _run_one(
             prefix_backend="none",
             spec_tokens=spec_tokens,
             spec_draft=spec_draft,  # type: ignore[arg-type]
+            spec_tie_eps=tie_eps,
+            spec_exact_kv=exact_kv,
         )
     )
     try:
@@ -115,6 +119,8 @@ def _run_one(
             "decode_tok_s": (n - 1) / decode_s if n > 1 else float("nan"),
             "e2e_tok_s": n / e2e,
             "peak_mem_gb": peak_gb,
+            "spec_tie_eps": tie_eps,
+            "spec_exact_kv": exact_kv,
             "steps": stats["steps"],
             "proposed": stats["proposed"],
             "accepted": stats["accepted"],
@@ -153,6 +159,18 @@ def main() -> None:
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--quantization", default="none", choices=_QUANT_CHOICES)
     p.add_argument("--cg", action="store_true", help="启用 decode CUDA Graph")
+    p.add_argument(
+        "--spec-tie-eps",
+        type=float,
+        default=0.0,
+        help="emit 位置近并列时用 decode 内核重算（部分修复，0=关闭）",
+    )
+    p.add_argument(
+        "--spec-exact-kv",
+        action="store_true",
+        help="bit-exact 模式：逐位置用 decode 内核重写 KV（每步多 accepted+1 次"
+        "前向；greedy 下与 baseline 逐位一致，但会吃掉大部分加速）",
+    )
     p.add_argument("--json", default="", help="把结果写成 JSON 文件")
     args = p.parse_args()
 
@@ -174,10 +192,18 @@ def main() -> None:
         quantization=args.quantization,
         cg=args.cg,
         spec_draft=args.spec_draft,
+        tie_eps=args.spec_tie_eps,
+        exact_kv=args.spec_exact_kv,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
-    base = _run_one(args.model, prompt, spec_tokens=0, **common)
-    print(f"[run] spec k={args.spec_tokens} draft={args.spec_draft}")
+    # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
+    base = _run_one(
+        args.model, prompt, spec_tokens=0, **{**common, "tie_eps": 0.0, "exact_kv": False}
+    )
+    print(
+        f"[run] spec k={args.spec_tokens} draft={args.spec_draft} "
+        f"tie_eps={args.spec_tie_eps} exact_kv={args.spec_exact_kv}"
+    )
     spec = _run_one(args.model, prompt, spec_tokens=args.spec_tokens, **common)
 
     speedup = base["decode_tok_s"] / spec["decode_tok_s"]

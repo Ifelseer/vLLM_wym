@@ -382,9 +382,11 @@ class ModelRunner:
         accepted = 0
         if self.batch.all_greedy:
             toks, accepted = accept_greedy(drafts, logits.argmax(dim=-1).tolist())
-            if self.config.spec_tie_eps > 0.0:
-                # tie 守卫可能追加一次 decode 前向（含集合通信），故也必须在
-                # 所有 rank 上执行；只有 driver 的返回值会被上层使用。
+            if self.config.spec_exact_kv:
+                # bit-exact：逐个位置用 decode 内核重写 KV（含集合通信，必须在
+                # 所有 rank 上执行；只有 driver 的返回值会被上层使用）
+                toks = self._kv_exact_rerun(s, drafts, accepted, toks)
+            elif self.config.spec_tie_eps > 0.0:
                 toks = self._tie_rerun(s, drafts, logits, accepted, toks)
         elif self.is_driver:
             # 温度采样：用**采样器实际使用的分布**（含 top-k/p/min-p 截断）做
@@ -397,6 +399,51 @@ class ModelRunner:
             return _SpecSamples()
         return _SpecSamples(tokens=toks, lens=[len(toks)])
 
+    def _kv_exact_rerun(
+        self,
+        s: SeqSchedule,
+        drafts: list[int],
+        accepted: int,
+        toks: list[int],
+    ) -> list[int]:
+        """bit-exact 模式：把 verify 写入的 anchor + accepted 草稿 KV 逐个用
+        **decode 内核**重写，并用最后一次重算的 argmax 作为输出 token。
+
+        为什么必须"逐个"重写：位置 q 的 K/V = ``k_proj(norm(h_q))``，而 ``h_q``
+        是上一层 attention 的输出。verify 走 paged-varlen、baseline decode 走
+        ``flash_attn_with_kvcache``，归约顺序不同 → ``h_q`` 差 ~1ulp → 写进
+        cache 的 K/V 也不同。只重算 emit 位置（``_tie_rerun``）管不到这件事：
+        8B 实测分叉发生在 verify 之后的**普通 decode** 步（第 45 个 token），
+        原因是它读到了 verify 写下的、略不同的 KV。
+
+        重写顺序必须从前往后：重算位置 p+i 时会读 p..p+i-1 的 KV，而那些位置
+        在前一轮已被纠正成 decode 内核的版本。
+
+        代价：每个 verify 步多 ``accepted+1`` 次 1-token 前向，accept_len 低时
+        收益会被吃光——所以定位是校验/参考模式，不是性能模式。
+        """
+        block_tokens = [s.token_ids[-1]] + list(drafts)
+        base_pos = s.num_cached_tokens
+        token: int | None = None
+        for i in range(accepted + 1):
+            vseq = SeqSchedule(
+                seq_id=s.seq_id,
+                block_table=s.block_table,
+                num_cached_tokens=base_pos + i,
+                token_ids=[block_tokens[i]],
+                need_sample=False,
+                temperature=s.temperature,
+                top_p=s.top_p,
+                top_k=s.top_k,
+                min_p=s.min_p,
+            )
+            out = self._run_decode([vseq])
+            if out is not None:
+                token = int(out[0])
+        if token is None:  # 非 driver rank：只为参与集合通信
+            return toks
+        return block_tokens[1 : accepted + 1] + [token]
+
     def _tie_rerun(
         self,
         s: SeqSchedule,
@@ -405,13 +452,17 @@ class ModelRunner:
         accepted: int,
         toks: list[int],
     ) -> list[int]:
-        """greedy tie 守卫：在精确并列处改用 **decode 内核**重算 emit 位置。
+        """（**部分**修复）greedy tie 守卫：emit 位置近并列时改用 decode 内核重算。
 
         背景：verify 走 paged-varlen prefill（``flash_attn_varlen_func``），
-        baseline decode 走 ``flash_attn_with_kvcache``。两者 K/V 完全相同，但
-        attention 的归约顺序不同，logits 会有 ~1ulp 级差异。目标分布出现精确
-        并列（实测 Qwen3-8B 某位置 top1 == top2 == 28.5）时，argmax 就会翻到
-        另一个 token，导致"无损"失败。
+        baseline decode 走 ``flash_attn_with_kvcache``，attention 归约顺序不同，
+        logits 差 ~1ulp；目标分布精确并列时 argmax 会翻转。
+
+        ⚠️ **它只能覆盖"emit 位置恰好并列"这一种情况**，因为 verify 写进 cache 的
+        anchor/accepted KV 本身也带着 ~1ulp 差异（K/V 的输入 hidden 由 attention
+        算出），后续普通 decode 读到这份 KV 仍会在并列处翻转——8B 实测分叉正是
+        发生在 verify 之后的 decode 步（第 45 个 token），本守卫完全没触发。
+        需要逐位保证时用 ``spec_exact_kv``（逐个位置用 decode 内核重写 KV）。
 
         修法：把该位置重新按 decode 通路跑一次（`_run_decode`，与 baseline 完全
         同路径，含 CUDA Graph / FP8 KV plan），用它的 argmax 作为 emit token。

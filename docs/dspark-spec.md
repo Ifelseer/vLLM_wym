@@ -190,11 +190,56 @@ rotate_half / ALL_ATTENTION_FUNCTIONS / GradientCheckpointingLayer / FlashAttent
 所以租机上的 4.57.6 大概率也齐（Phase 3 第一步就是跑一遍符号检查，缺哪个补哪个，不必
 为一个 config 字段去升 torch）。
 
-### 6.3 仍未确认（Phase 3 前必须读代码）
+### 6.3 `crop(start)` 语义（已核实，2026-10-25）
 
-**`crop(start)` 的确切语义**：`start` 是「anchor 在序列中的位置」还是「草稿 KV 的已有
-长度」？需读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB）。
-这决定草稿 KV 的追加/回滚规则。**在读到之前不写草稿 KV 代码**（盲写必错）。
+读 `deepspec/eval/base_evaluator.py::generate_decoding_sample`（26 KB）后的结论：
+
+**`start` = 已提交长度**（`output_ids` 中已确定的 token 数），即"下一个待写位置"，
+初始值为 `prompt_len`。不是"草稿 KV 的已有长度"。
+
+每步流程（源码逐行）：
+
+```python
+verify_input_ids = [anchor, d1..dk]                  # 长度 k+1
+target_output = target_model(input_ids=verify_input_ids,
+                             position_ids=position_ids[:, start:start+k+1],
+                             past_key_values=pkv_target, use_cache=True)
+# → 写位置 start..start+k，cache 长度变为 start+k+1
+output_ids[:, start : start+j+1] = verify_input_ids[:, :j+1]
+output_ids[:, start+j+1] = next_token                # 恢复/bonus
+start += j + 1
+pkv_target.crop(start)                               # 丢弃被拒草稿的 KV
+```
+
+所以 `crop` 的参数是**更新后的** `start`（`+j+1` 之后），语义 = 保留 anchor 与
+accepted 草稿的 KV、丢弃被拒部分。**草稿侧另有一次 crop，参数是更新前的 `start`**：
+
+```python
+# forward_dspark_draft_block
+draft_position_ids = position_ids[:, pkv_draft.get_seq_length() : start + block]
+block_hidden = model._forward_backbone(..., past_key_values=pkv_draft, is_causal=False)
+pkv_draft.crop(start)        # ← 保留 0..start-1 的 context，丢弃块内 block 个位置
+```
+
+即草稿 KV 只保存**已提交 token 的 context 特征**，块内那 k 个候选的 KV 用完即弃。
+`_update` 再把 `target_output.hidden_states[:accepted+1]` 作为下一步的 context 输入。
+
+**与本引擎的映射（语义等价，只是"物理删除" vs "逻辑截断"）**：
+
+| DeepSpec | 本引擎 |
+|---|---|
+| `start`（下一个待写位置） | `seq.num_cached_tokens` |
+| `pkv_target.crop(start_new)` | `num_cached_tokens += 1+j` + **不 publish** 被拒块 |
+| `pkv_draft.crop(start)` | 草稿 KV 只保留已提交 token 的 context（Phase 3） |
+| `verify_input_ids` | `[last_token] + draft_ids` |
+| `committed_tokens` | `tokens = accepted drafts + next_token` |
+
+差别只在"被拒草稿的 KV 是物理删除还是留在池里"：我们由 `cache_seqlens =
+num_cached_tokens` 保证**永不读到**越界位置，下次写同一 slot 时被覆盖，因此等价。
+
+⚠️ Phase 3 实现草稿 KV 时注意：草稿 context 长度是 **`start`（已提交 token 数）**，
+不是 `num_cached_tokens + 1`——多算一个会把 anchor 重复计入（上游已把 anchor 作为
+块的第 0 个位置喂进去）。
 
 ### 6.4 尚未做
 
