@@ -252,6 +252,20 @@ class TestSchedulerSpec:
         assert seq.is_finished
         assert seq.num_completion_tokens == 2
 
+    def test_worker_side_proposed_is_counted(self):
+        """dspark 的草稿在 worker 侧产出：proposed 只能由 worker 回传。"""
+        s = _scheduler(spec_tokens=4)
+        seq = _seq(list(range(6)), cached=5)
+        s.update(ScheduledBatch(decodes=[seq]), [], [1, 2, 900], [3], [4])
+        assert s.spec_stats["proposed"] == 4
+        assert s.spec_stats["accepted"] == 2
+        assert s.spec_stats["steps"] == 1
+
+        # ngram 路径不回传 d_proposed → 不能重复计数
+        seq2 = _seq(list(range(6)), cached=5)
+        s.update(ScheduledBatch(decodes=[seq2]), [], [7], [1])
+        assert s.spec_stats["proposed"] == 4
+
     def test_no_spec_keeps_old_behaviour(self):
         """spec_tokens=0 时必须走原来的一 token 路径。"""
         s = _scheduler(spec_tokens=0)

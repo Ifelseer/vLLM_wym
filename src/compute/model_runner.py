@@ -31,6 +31,8 @@ class _SpecSamples:
 
     tokens: list[int] = field(default_factory=list)
     lens: list[int] = field(default_factory=list)
+    #: 每序列**提出**的草稿数（worker 侧起草时调度器算不出来，只能回传）
+    proposed: list[int] = field(default_factory=list)
 
 
 class ModelRunner:
@@ -487,14 +489,19 @@ class ModelRunner:
             # 要追加的 context 段（上游 `_update` 同款，取 [:accepted+1]）
             self._dspark.update(
                 s.seq_id,
-                self._aux_buf[: accepted + 1].clone(),
+                self._aux_buf[: accepted + 1].clone().unsqueeze(0),
                 start=s.num_cached_tokens + 1 + accepted,
             )
         self._draft_probs = None
 
         if not self.is_driver:
             return _SpecSamples()
-        return _SpecSamples(tokens=toks, lens=[len(toks)])
+        return _SpecSamples(
+            tokens=toks,
+            lens=[len(toks)],
+            # worker 侧起草（dspark）时，调度器不知道提了几个，必须回传
+            proposed=[len(drafts)] if self._dspark is not None else [],
+        )
 
     def _kv_exact_rerun(
         self,
@@ -672,7 +679,10 @@ class ModelRunner:
         ):
             # 首步的 context = 整段 prompt 的 aux hidden。只在"单 chunk、从头开始"
             # 时记录；chunked prefill 下不做草稿（v1 取舍，正确性不受影响）。
-            self._dspark_pending[seqs[0].seq_id] = self._aux_buf[:n_tokens].clone()
+            # 草稿模型的 target_hidden_states 约定是 [1, n, F]（带 batch 维）
+            self._dspark_pending[seqs[0].seq_id] = (
+                self._aux_buf[:n_tokens].clone().unsqueeze(0)
+            )
 
         if not self.is_last_pp:
             self._send_intermediate(hidden)
@@ -736,18 +746,24 @@ class ModelRunner:
 
     def read_samples(
         self, n_p: int, n_d: int
-    ) -> tuple[list[int], list[int], list[int] | None]:
-        """返回 ``(prefill_ids, decode_ids, decode_lens)``。
+    ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
+        """返回 ``(prefill_ids, decode_ids, decode_lens, decode_proposed)``。
 
-        ``decode_lens`` 仅在投机 decode 下非 None：``decode_ids`` 是各序列的
-        token 拼接，``decode_lens[i]`` 表示第 i 条序列占了几个（= 接受草稿数+1）。
+        ``decode_lens[i]`` = 第 i 条序列本轮产出的 token 数（= 接受草稿数+1）。
+        ``decode_proposed[i]`` = 第 i 条序列**提出**的草稿数——只有 worker 侧起草
+        （dspark）时才非空；ngram 在调度器侧就统计过了，避免重复计数。
         """
         self._copy_event.synchronize()
         p_ids = self._sample_cpu[n_d : n_d + n_p].tolist() if n_p else []
         if self._spec is not None:
-            return p_ids, list(self._spec.tokens), list(self._spec.lens)
+            return (
+                p_ids,
+                list(self._spec.tokens),
+                list(self._spec.lens),
+                list(self._spec.proposed) or None,
+            )
         d_ids = self._sample_cpu[:n_d].tolist() if n_d else []
-        return p_ids, d_ids, None
+        return p_ids, d_ids, None, None
 
     def _resolve_compile_mode(self) -> str:
         """单卡 / 仅 PP 用用户 mode；含 TP 时用 max-autotune-no-cudagraphs。"""

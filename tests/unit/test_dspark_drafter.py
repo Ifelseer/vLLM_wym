@@ -126,6 +126,27 @@ class TestKvProtocol:
             outs.append(tokens)
         assert outs[0] == outs[1]
 
+    def test_truncates_to_max_proposal(self, drafter):
+        """块宽由 checkpoint 固定（7），但引擎的 --spec-tokens 可能更小。
+
+        多给会让 verify 写到**没分配块**的位置上，必须在 worker 侧截断。
+        """
+        dr = DSparkDrafter(
+            drafter.model, device=torch.device("cpu"), max_proposal=2
+        )
+        tokens, probs = dr.propose(
+            7, anchor_token_id=5, start=SEG0, first_ctx=_ctx(SEG0)
+        )
+        assert len(tokens) == 2, f"应截到 2，实际 {len(tokens)}"
+
+    def test_accepts_2d_context(self, drafter):
+        """引擎侧传的是二维切片 [n, F]，drafter 要能容忍（否则 cat 报 got 2 and 3）。"""
+        drafter.reset(8)
+        tokens, _ = drafter.propose(
+            8, anchor_token_id=5, start=SEG0, first_ctx=_ctx(SEG0).squeeze(0)
+        )
+        assert len(tokens) == BLOCK
+
     def test_temperature_returns_probs(self, drafter):
         drafter.temperature = 0.8
         try:

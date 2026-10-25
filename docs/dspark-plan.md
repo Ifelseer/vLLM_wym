@@ -229,10 +229,23 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 > - 接口形态：`Drafter` 出现两种实现——`ngram` 是调度器侧纯 CPU 函数，`dspark`
 >   返回一个 `worker_side` 标记，调度器只按上限预留 `1+k` 个位置/块，真实草稿由
 >   `ModelRunner._propose_dspark()` 产出并直接进 verify。
-> - 仍未做：**4090 上的端到端验收**（需要真实 checkpoint）。要验的不变量：
->   同一段 token 由「prefill(5)」与「prefill(3)+verify(2)」得到的 aux hidden
->   必须逐位相同（aux 是逐位置量，不该随批组成变化），以及 greedy 逐位一致 /
->   acceptance length ≥ vLLM 基线 90%。
+> - **首次上机验收（2026-10-25，租机 4090 24GB）**：`tests/gpu/test_dspark_aux_gpu.py`
+>   2 passed（chunked prefill vs 整段前向的 aux 逐位置一致 → `h+residual` 口径正确）；
+>   DSpark 草稿路径跑通：**accept_rate 73.4%、accept_len 3.94**（n=64，eager/低显存
+>   口径，非正式性能数）。
+> - 上机暴露并已修的三个集成问题：
+>   ① aux 交接维度——引擎侧给的是 2D `[n, F]`，草稿模型要 3D `[1, n, F]`（现在
+>   两处显式 `unsqueeze(0)`，drafter 侧也容忍 2D）；
+>   ② 草稿数必须截到 `spec_tokens`——块宽由 checkpoint 固定（7），若引擎只想验 4 个
+>   却让 worker 给 7 个，verify 会写到**未分配块**的位置（越界写 KV）；
+>   ③ `accept_rate` 断链——worker 侧起草时调度器不知道提了几个，现在由
+>   `_SpecSamples.proposed` 回传并按 `d_proposed` 计入 `spec_stats`。
+> - **显存结论（重要）**：24GB 单卡放不下 `BF16 目标(15.3G) + BF16 草稿(4.7G) +
+>   --cg + 64 KV blocks(2.25G) + 图池/激活(~5G)`。正式口径需要 40G+ 卡或 **FP8 目标**
+>   （权重 7.7G，总 ~17G）。低显存（eager、8 blocks、budget=512）只够做正确性与
+>   接受率验收，不能当性能数。
+> - 仍未做：`--cg` 口径的正式性能数、与 vLLM 的 acceptance length 对照
+>   （vLLM 基线那一条至今没跑）。
 
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 

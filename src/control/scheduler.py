@@ -226,11 +226,14 @@ class Scheduler:
         p_ids: list[int],
         d_ids: list[int],
         d_lens: list[int] | None = None,
+        d_proposed: list[int] | None = None,
     ) -> list[EngineCoreOutput]:
         outputs: list[EngineCoreOutput] = []
         if sched.decodes:
             if self.spec_tokens > 0:
-                outputs.extend(self._update_spec_decode(sched.decodes, d_ids, d_lens))
+                outputs.extend(
+                    self._update_spec_decode(sched.decodes, d_ids, d_lens, d_proposed)
+                )
             else:
                 outputs.extend(
                     self._update_batch(sched.decodes, d_ids, is_prefill=False)
@@ -244,6 +247,7 @@ class Scheduler:
         seqs: list[Sequence],
         d_ids: list[int],
         d_lens: list[int] | None,
+        d_proposed: list[int] | None = None,
     ) -> list[EngineCoreOutput]:
         """投机 decode 的落账：接受 j 个草稿 + 1 个新 token。
 
@@ -274,6 +278,10 @@ class Scheduler:
             accepted = max(0, len(toks) - 1)
             self.spec_stats["steps"] += 1
             self.spec_stats["accepted"] += accepted
+            if d_proposed is not None and i < len(d_proposed):
+                # worker 侧起草（dspark）时，调度器不知道自己提了几个草稿，
+                # 只能由 worker 回传；ngram 在 _propose 里已经计过，不重复加。
+                self.spec_stats["proposed"] += int(d_proposed[i])
             seq.num_accepted = accepted
             seq.draft_token_ids = []
             seq.num_cached_tokens += 1 + accepted

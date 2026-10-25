@@ -136,11 +136,11 @@ class EngineCore:
 
         # ---- 采样与后处理 ----
         # 从执行器读回采样结果（prefill 和 decode 分开返回）。
-        p_ids, d_ids, d_lens = self.executor.read_samples(n_p, n_d)
+        p_ids, d_ids, d_lens, d_prop = self.executor.read_samples(n_p, n_d)
 
         # 调度器根据采样结果更新各序列状态：
         #   追加新 token、判断是否结束、回收已完成序列的 KV 块。
-        outputs = self.scheduler.update(sched, p_ids, d_ids, d_lens)
+        outputs = self.scheduler.update(sched, p_ids, d_ids, d_lens, d_prop)
         return outputs, metric
 
     # ------------------------------------------------------------------ #

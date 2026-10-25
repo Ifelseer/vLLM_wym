@@ -52,10 +52,17 @@ class DSparkDrafter:
         *,
         device: torch.device,
         temperature: float = 0.0,
+        max_proposal: int = 0,
     ) -> None:
         self.model = model
         self.device = device
+        # 块宽由 checkpoint 决定（官方 8B 是 7）：一次前向固定产出这么多位置
         self.block_size = int(model.block_size)
+        # 实际拿几个去验证。**必须 ≤ 调度器预留的 k**，否则 verify 会写到没
+        # 分配块的位置上（越界写 KV）。0 表示不截断（= block_size）。
+        self.max_proposal = min(
+            self.block_size, int(max_proposal) if max_proposal > 0 else self.block_size
+        )
         self.mask_token_id = int(model.mask_token_id)
         self.temperature = float(temperature)
         self._state: dict[int, _DraftState] = {}
@@ -126,6 +133,9 @@ class DSparkDrafter:
 
         if st.pending_ctx is None:
             return [], None
+        ctx = st.pending_ctx
+        if ctx.dim() == 2:  # 容忍 [n, F]：引擎侧传的是二维切片
+            ctx = ctx.unsqueeze(0)
 
         block = self.block_size
         cached = st.past.get_seq_length()
@@ -147,7 +157,7 @@ class DSparkDrafter:
         hidden = self.model._forward_backbone(
             position_ids=positions,
             noise_embedding=self.model.embed_tokens(ids),
-            target_hidden_states=st.pending_ctx,
+            target_hidden_states=ctx,
             attention_mask=None,
             past_key_values=st.past,
             use_cache=True,
@@ -173,5 +183,13 @@ class DSparkDrafter:
             # 温度采样才需要真实草稿分布；greedy 下 q 是 one-hot，验证侧按
             # draft_probs=None 处理即可（省一次 [k, vocab] 的 softmax）
             probs = torch.softmax(corrected.float() / self.temperature, dim=-1)
+
+        # 截断到调度器预留的 k：块宽由 checkpoint 固定（7），但引擎可能只想验证
+        # 前 k 个。多给会让 verify 写到未分配块的位置上。
+        keep = self.max_proposal
+        if keep < block:
+            tokens = tokens[:, :keep]
+            if probs is not None:
+                probs = probs[:, :keep]
 
         return tokens[0].tolist(), (None if probs is None else probs[0])

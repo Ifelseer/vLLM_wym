@@ -114,7 +114,7 @@ class Executor(ABC):
     @abstractmethod
     def read_samples(
         self, n_p: int, n_d: int
-    ) -> tuple[list[int], list[int], list[int] | None]: ...
+    ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]: ...
 
     @abstractmethod
     def destroy(self) -> None: ...
@@ -193,8 +193,8 @@ def worker_loop(worker: Worker) -> None:
 
         n_p, n_d = counts
         channel.send(enc.encode([n_p, n_d]), dst=0)
-        p_ids, d_ids, d_lens = worker.read_samples(n_p, n_d)
-        channel.send(enc.encode([p_ids, d_ids, d_lens or []]), dst=0)
+        p_ids, d_ids, d_lens, d_prop = worker.read_samples(n_p, n_d)
+        channel.send(enc.encode([p_ids, d_ids, d_lens or [], d_prop or []]), dst=0)
 
 
 # ------------------------------------------------------------------ #
@@ -240,7 +240,7 @@ class UniprocExecutor(Executor):
 
     def read_samples(
         self, n_p: int, n_d: int
-    ) -> tuple[list[int], list[int], list[int] | None]:
+    ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
         return self.worker.read_samples(n_p, n_d)
 
     def collective_rpc(self, op: str, **payload) -> object:
@@ -412,21 +412,24 @@ class MultiprocExecutor(Executor):
 
     def read_samples(
         self, n_p: int, n_d: int
-    ) -> tuple[list[int], list[int], list[int] | None]:
+    ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
         """
             读取采样结果。
 
             采样在 rank0 时直接本地读取；
             否则等待采样 rank 通过 Gloo 送回 token id 列表。
 
-            ``d_lens`` 仅在投机 decode 下非空（每序列的 token 数）。
+            ``d_lens`` / ``d_prop`` 仅在投机 decode 下非空：前者是每序列产出的
+            token 数（接受草稿数+1），后者是每序列**提出**的草稿数（worker 侧
+            起草时才需要回传，用于算 accept_rate）。
         """
         if self.sampler_rank == 0:
             return self.worker.read_samples(n_p, n_d)
         msg = self._dec_sample.decode(self._channel.recv(self.sampler_rank))
         p_ids, d_ids = msg[0], msg[1]
         d_lens = msg[2] if len(msg) > 2 and msg[2] else None
-        return p_ids, d_ids, d_lens
+        d_prop = msg[3] if len(msg) > 3 and msg[3] else None
+        return p_ids, d_ids, d_lens, d_prop
 
     def shutdown(self) -> None:
         """广播 shutdown 命令，通知所有子进程退出命令循环。"""

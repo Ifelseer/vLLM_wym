@@ -276,7 +276,7 @@ class Worker:
 
     def read_samples(
         self, n_p: int, n_d: int
-    ) -> tuple[list[int], list[int], list[int] | None]:
+    ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
         assert self.model_runner is not None
         return self.model_runner.read_samples(n_p, n_d)
 
