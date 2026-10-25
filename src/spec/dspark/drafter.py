@@ -208,10 +208,19 @@ class DSparkDrafter:
 
     def _row(self, seq_id: int) -> int:
         row = self._row_of.get(seq_id)
-        if row is None:
+        if row is not None:
+            return row
+        used = set(self._row_of.values())
+        free = [i for i in range(self.max_rows) if i not in used]
+        if not free:
+            # 行池满：回收最老的序列。被回收的序列之后拿不到 first_ctx，会退化成
+            # "本步不起草"——只损失收益，不影响正确性（不会越界、不会算错）。
+            victim = next(iter(self._row_of))
+            self.reset_seq(victim)
             used = set(self._row_of.values())
-            row = next(i for i in range(len(used) + 1) if i not in used)
-            self._row_of[seq_id] = row
+            free = [i for i in range(self.max_rows) if i not in used]
+        row = free[0]
+        self._row_of[seq_id] = row
         return row
 
     def _ensure_padded(self) -> PaddedKVCache:

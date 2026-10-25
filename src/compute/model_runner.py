@@ -548,7 +548,13 @@ class ModelRunner:
                     f"draft target_layer_ids {got} != config {want}; "
                     "两边必须一致，否则喂给草稿的 context 特征顺序会错位"
                 )
-            self._dspark = DSparkDrafter(draft, device=self.device)
+            # 行池要覆盖"同时活跃 + 历史未回收"的序列：bench 的 warmup/reps 会
+            # 反复创建请求，行数不足会 IndexError。按并发数留 4 倍余量。
+            self._dspark = DSparkDrafter(
+                draft,
+                device=self.device,
+                max_rows=max(8, self.config.max_num_seqs * 4),
+            )
         return self._dspark
 
     def _propose_dspark(self, seqs: list[SeqSchedule]) -> list[list[int]]:

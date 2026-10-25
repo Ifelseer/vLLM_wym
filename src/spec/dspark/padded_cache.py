@@ -164,14 +164,17 @@ class PaddedKVCache:
         kv_len = int(self.lens[idx].max()) + length
         return kk[idx][:, :, :kv_len], vv[idx][:, :, :kv_len]
 
-    def mask(self, q_len: int) -> torch.Tensor:
+    def mask(self, q_len: int, dtype: torch.dtype | None = None) -> torch.Tensor:
         """additive attention mask ``[B, 1, q_len, kv_len]``（B = 本步参与行数）。"""
         rows = self._rows
         kv_len = self._kv_len
         idx = torch.tensor(rows, dtype=torch.long, device=self.device)
         valid = self.valid[idx][:, :kv_len]
+        # ⚠️ dtype 必须与 query 一致（bf16 模型 + fp32 mask 会被 SDPA 拒绝：
+        # "invalid dtype for bias"）。默认用缓存自身的 dtype。
+        out_dtype = self.dtype if dtype is None else dtype
         additive = torch.zeros(
-            len(rows), 1, 1, kv_len, dtype=torch.float32, device=self.device
+            len(rows), 1, 1, kv_len, dtype=out_dtype, device=self.device
         )
         additive = additive.masked_fill(
             ~valid.unsqueeze(1).unsqueeze(2), float("-inf")
