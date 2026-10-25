@@ -118,6 +118,10 @@ class EngineConfig:
     #    本来就在图外。
     spec_verify_graph: bool = False
     spec_verify_graph_max_k: int = 256
+    # 草稿批量化：B 条序列的块前向合成一次（权重只读一遍）。
+    # 逐序列串行时 b=4 的草稿占步时 61%，批量化后预期 b=4 加速比 1.70x -> ~3x。
+    # 等价性已由 CPU 单测保证（批量与单跑 token 逐位相同）。
+    spec_draft_batch: bool = False
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)

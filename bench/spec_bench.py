@@ -68,6 +68,7 @@ def _run_one(
     draft_model: str = "",
     num_blocks: int = 64,
     verify_graph: bool = False,
+    draft_batch: bool = False,
     max_num_seqs: int = 1,
 ) -> dict:
     import torch
@@ -90,6 +91,7 @@ def _run_one(
             spec_exact_kv=exact_kv,
             spec_draft_model=draft_model,
             spec_verify_graph=verify_graph,
+            spec_draft_batch=draft_batch,
         )
     )
     try:
@@ -191,6 +193,11 @@ def main() -> None:
         default=1,
         help="并发请求数（同时也是调度器的 max_num_seqs）。>1 时量的是聚合吞吐",
     )
+    p.add_argument(
+        "--spec-draft-batch",
+        action="store_true",
+        help="草稿批量化：B 条序列一次前向（等价性见 test_dspark_drafter_batch）",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--devices", default="0")
@@ -240,6 +247,7 @@ def main() -> None:
         draft_model=args.spec_draft_model,
         num_blocks=args.num_kvcache_blocks,
         verify_graph=args.spec_verify_graph,
+        draft_batch=args.spec_draft_batch,
         max_num_seqs=args.max_num_seqs,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")

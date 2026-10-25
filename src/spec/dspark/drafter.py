@@ -29,6 +29,7 @@ import torch
 from transformers.cache_utils import DynamicCache
 
 from .modeling import Qwen3DSparkModel
+from .padded_cache import PaddedKVCache
 
 
 @dataclass
@@ -53,6 +54,8 @@ class DSparkDrafter:
         device: torch.device,
         temperature: float = 0.0,
         max_proposal: int = 0,
+        max_ctx_len: int = 4096,
+        max_rows: int = 8,
     ) -> None:
         self.model = model
         self.device = device
@@ -66,6 +69,11 @@ class DSparkDrafter:
         self.mask_token_id = int(model.mask_token_id)
         self.temperature = float(temperature)
         self._state: dict[int, _DraftState] = {}
+        # 批量化：seq_id → 行号（长期持有），以及共享的 padded KV
+        self._row_of: dict[int, int] = {}
+        self._padded: PaddedKVCache | None = None
+        self.max_ctx_len = int(max_ctx_len)
+        self.max_rows = int(max_rows)
 
     # ---------------------------------------------------------------- #
     # 状态管理
@@ -193,3 +201,156 @@ class DSparkDrafter:
                 probs = probs[:, :keep]
 
         return tokens[0].tolist(), (None if probs is None else probs[0])
+
+    # ---------------------------------------------------------------- #
+    # 批量起草（B 条序列一次前向，权重只读一遍）
+    # ---------------------------------------------------------------- #
+
+    def _row(self, seq_id: int) -> int:
+        row = self._row_of.get(seq_id)
+        if row is None:
+            used = set(self._row_of.values())
+            row = next(i for i in range(len(used) + 1) if i not in used)
+            self._row_of[seq_id] = row
+        return row
+
+    def _ensure_padded(self) -> PaddedKVCache:
+        if self._padded is None:
+            cfg = self.model.config
+            self._padded = PaddedKVCache(
+                num_layers=int(cfg.num_hidden_layers),
+                num_kv_heads=int(cfg.num_key_value_heads),
+                head_dim=int(getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads),
+                num_rows=max(1, self.max_rows),
+                max_len=self.max_ctx_len,
+                device=self.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
+        return self._padded
+
+    def reset_seq(self, seq_id: int) -> None:
+        """释放一条序列的草稿状态与 KV 行。"""
+        self.reset(seq_id)
+        row = self._row_of.pop(seq_id, None)
+        if row is not None and self._padded is not None:
+            self._padded.reset_row(row)
+
+    @torch.inference_mode()
+    def propose_batch(
+        self,
+        items: list[tuple[int, int, int, torch.Tensor | None]],
+    ) -> list[tuple[list[int], torch.Tensor | None]]:
+        """一次前向为多条序列起草。``items`` = ``(seq_id, anchor, start, first_ctx)``。
+
+        只有"有 pending_ctx 且账本一致"的序列参与批量；其余返回空（调用方退化为
+        普通 decode）。参与者不足 2 条时直接走单序列 ``propose``，避免为 B=1 付
+        掩码/填充的复杂度。
+        """
+        results: list[tuple[list[int], torch.Tensor | None]] = [([], None)] * len(items)
+
+        # 1) 结算状态：谁能参与
+        parts: list[int] = []          # items 下标
+        segs: list[int] = []
+        for i, (seq_id, _anchor, start, first_ctx) in enumerate(items):
+            st = self._state.get(seq_id)
+            if st is None:
+                if first_ctx is None or start <= 0:
+                    continue
+                st = _DraftState(past=DynamicCache(), pending_ctx=first_ctx, start=start)
+                self._state[seq_id] = st
+            elif st.start != start:
+                self.reset_seq(seq_id)
+                continue
+            ctx = st.pending_ctx
+            if ctx is None:
+                continue
+            parts.append(i)
+            segs.append(int(ctx.shape[-2]) if ctx.dim() == 3 else int(ctx.shape[0]))
+
+        if len(parts) < 2:
+            # 退化：逐序列单跑（复用已验证的路径）
+            out: list[tuple[list[int], torch.Tensor | None]] = []
+            for seq_id, anchor, start, first_ctx in items:
+                out.append(
+                    self.propose(
+                        seq_id, anchor_token_id=anchor, start=start, first_ctx=first_ctx
+                    )
+                )
+            return out
+
+        # 2) 组批：ctx pad 到 seg_max，位置按各自 start 排
+        cache = self._ensure_padded()
+        rows = [self._row(items[i][0]) for i in parts]
+        seg_max = max(segs)
+        block = self.block_size
+        feat = int(self._state[items[parts[0]][0]].pending_ctx.shape[-1])
+        ctx_pad = torch.zeros(
+            len(parts), seg_max, feat,
+            dtype=next(self.model.parameters()).dtype, device=self.device,
+        )
+        ids = torch.full(
+            (len(parts), block), self.mask_token_id, dtype=torch.long, device=self.device
+        )
+        anchors = []
+        pos_rows = []
+        for k, i in enumerate(parts):
+            seq_id, anchor, start, _ = items[i]
+            st = self._state[seq_id]
+            ctx = st.pending_ctx
+            ctx = ctx if ctx.dim() == 3 else ctx.unsqueeze(0)
+            ctx_pad[k, : segs[k]] = ctx[0]
+            ids[k, 0] = int(anchor)
+            anchors.append(int(anchor))
+            cached = int(start) - segs[k]
+            # 位置必须按"真实 token"排：ctx 段占 [cached, start)，块占 [start, start+block)。
+            # **不能用 padded 的 kv 偏移**——那会把短行的块位置整体后移 seg_max-seg。
+            row_pos = torch.zeros(
+                seg_max + block, dtype=torch.long, device=self.device
+            )
+            row_pos[: segs[k]] = torch.arange(
+                cached, cached + segs[k], device=self.device
+            )
+            if seg_max > segs[k]:
+                row_pos[segs[k] : seg_max] = cached  # pad 被 mask，值无所谓
+            row_pos[seg_max:] = torch.arange(start, start + block, device=self.device)
+            pos_rows.append(row_pos)
+
+        for k, r in enumerate(rows):
+            # 行已有的 context 长度必须等于 start - seg；不一致说明账本漂移
+            want = int(items[parts[k]][2]) - segs[k]
+            if cache.row_len(r) != want:
+                cache.seed_row(r, want)
+
+        kv_len = cache.begin_step(rows, segs, seg_max, block)
+        # q 只有 block 个（块内非因果），kv 才是 seg_max+block —— 掩码按 q 长度给
+        mask = cache.mask(q_len=block)
+        hidden = self.model._forward_backbone(
+            position_ids=torch.stack(pos_rows),
+            noise_embedding=self.model.embed_tokens(ids),
+            target_hidden_states=ctx_pad,
+            attention_mask=mask,
+            past_key_values=cache,
+            use_cache=True,
+            is_causal=False,
+        )
+        cache.crop()
+        for i in parts:
+            self._state[items[i][0]].pending_ctx = None
+
+        block_hidden = hidden[:, :block, :]
+        base_logits = self.model.compute_logits(block_hidden)
+        tokens, corrected = self.model.sample_draft_tokens(
+            base_logits,
+            first_prev_token_ids=torch.tensor(anchors, dtype=torch.long, device=self.device),
+            temperature=self.temperature,
+            hidden_states=block_hidden,
+        )
+        probs = None
+        if self.temperature > 1e-5:
+            probs = torch.softmax(corrected.float() / self.temperature, dim=-1)
+        keep = self.max_proposal
+        for k, i in enumerate(parts):
+            tk = tokens[k].tolist()[:keep]
+            pk = None if probs is None else probs[k][:keep]
+            results[i] = (tk, pk)
+        return results

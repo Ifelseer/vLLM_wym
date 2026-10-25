@@ -61,7 +61,7 @@ class TestPaddedKVCache:
         rows = [0, 1]
         c.begin_step(rows, [1, 1], seg_max=1, block=2)
         c.update(_kv(2, 3, 1.0), _kv(2, 3, 1.0), 0, rows)
-        c.crop(rows, [1, 1])
+        c.crop()
         assert c.row_len(0) == 0 + 1 and c.row_len(1) == 1
         assert c.row_len(3) == 7, "未参与的行不能被推进"
         assert bool(c.valid[3, :7].all()) and not bool(c.valid[3, 7:].any())
@@ -72,7 +72,7 @@ class TestPaddedKVCache:
         # seg_max=3：行 0 有 2 个真实 ctx（1 pad），行 1 只有 1 个（2 pad）
         c.begin_step(rows, [2, 1], seg_max=3, block=2)
         c.update(_kv(2, 5, 1.0), _kv(2, 5, 1.0), 0, rows)
-        m = c.mask(rows, kv_len=5, q_len=2)
+        m = c.mask(q_len=2)
         assert m.shape == (2, 1, 2, 5)
         assert not torch.isneginf(m[0, 0, 0, 1])
         assert torch.isneginf(m[0, 0, 0, 2]), "seg_max 尾部的 pad 必须被 mask"
@@ -87,7 +87,7 @@ class TestPaddedKVCache:
         rows = [0, 1]
         c.begin_step(rows, [2, 2], seg_max=2, block=3)
         c.update(_kv(2, 5, 1.0), _kv(2, 5, 1.0), 0, rows)
-        c.crop(rows, [2, 2])
+        c.crop()
         assert [c.row_len(0), c.row_len(1)] == [6, 4], "应保留 已有长度 + seg"
         assert bool(c.valid[0, :6].all()) and not bool(c.valid[0, 6:].any())
         assert bool(c.valid[1, :4].all()) and not bool(c.valid[1, 4:].any())
@@ -99,7 +99,7 @@ class TestPaddedKVCache:
         c.seed_row(1, 4)
         c.begin_step(rows, [1, 1], seg_max=1, block=2)
         c.update(_kv(2, 3, 1.0), _kv(2, 3, 1.0), 0, rows)
-        c.crop(rows, [1, 1])
+        c.crop()
         kv_len = c.begin_step(rows, [1, 1], seg_max=1, block=2)
         assert kv_len == 5 + 3
         kk, _ = c.update(_kv(2, 3, 2.0), _kv(2, 3, 2.0), 0, rows)

@@ -556,6 +556,21 @@ class ModelRunner:
         dr = self._ensure_dspark()
         if dr is None:
             return [[] for _ in seqs]
+        if self.config.spec_draft_batch and len(seqs) > 1:
+            # 一次前向算完 B 行的草稿（每行自己的 ctx/KV），权重只读一遍
+            items = [
+                (
+                    s.seq_id,
+                    s.token_ids[-1],
+                    s.num_cached_tokens,
+                    self._dspark_pending.pop(s.seq_id, None),
+                )
+                for s in seqs
+            ]
+            res = dr.propose_batch(items)
+            self._draft_probs = [p for _, p in res]
+            return [t for t, _ in res]
+
         out: list[list[int]] = []
         probs_all: list[torch.Tensor | None] = []
         for s in seqs:

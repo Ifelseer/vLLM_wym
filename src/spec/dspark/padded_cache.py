@@ -61,6 +61,10 @@ class PaddedKVCache:
             self.num_rows, self.max_len, dtype=torch.bool, device=device
         )
         self._new_len = 0
+        #: 本步参与的行 / 每行的真实 ctx 段长 / 本步 attention 的 kv 长度
+        self._rows: list[int] = []
+        self._seg_rows: list[int] = []
+        self._kv_len = 0
 
     # ---------------------------------------------------------------- #
     # 行管理
@@ -70,6 +74,13 @@ class PaddedKVCache:
         """释放一行（序列结束 / 状态漂移）。"""
         self.lens[row] = 0
         self.valid[row].zero_()
+
+    def get_seq_length(self) -> int:
+        """供 `Cache` 协议使用（部分调用方会问；取参与行的最大长度）。"""
+        if not self._rows:
+            return 0
+        idx = torch.tensor(self._rows, dtype=torch.long, device=self.device)
+        return int(self.lens[idx].max())
 
     def row_len(self, row: int) -> int:
         return int(self.lens[row])
@@ -90,7 +101,8 @@ class PaddedKVCache:
     # ---------------------------------------------------------------- #
 
     def begin_step(
-        self, rows: list[int], seg_rows: list[int], seg_max: int, block: int
+        self, rows: list[int] | None = None, seg_rows: list[int] | None = None,
+        seg_max: int = 0, block: int = 0,
     ) -> int:
         """登记本步新增区段的有效位，返回本步 attention 的 KV 长度。
 
@@ -100,6 +112,10 @@ class PaddedKVCache:
 
         返回 ``max(参与行的 lens) + L``。
         """
+        if rows is None:
+            rows = self._rows
+        if seg_rows is None:
+            seg_rows = self._seg_rows
         assert len(rows) == len(seg_rows)
         new_len = seg_max + block
         for r, seg in zip(rows, seg_rows):
@@ -110,15 +126,22 @@ class PaddedKVCache:
             )
             self.valid[r, s : s + seg] = True           # 真实 ctx 段
             self.valid[r, s + seg_max : end] = True      # block 个候选
+        self._rows = list(rows)
+        self._seg_rows = list(seg_rows)
         self._new_len = new_len
-        return int(self.lens[rows].max()) + new_len
+        self._kv_len = int(self.lens[self._rows].max()) + new_len
+        return self._kv_len
 
-    def update(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, rows: list[int]):
+    def update(
+        self, k: torch.Tensor, v: torch.Tensor, layer_idx: int, cache_kwargs=None
+    ):
         """写入参与行的 K/V，返回这些行的整段 padded K/V。
 
         ``k``/``v``: ``[len(rows), H, L, D]``，``L`` 必须等于 ``begin_step`` 的
         ``seg_max + block``。返回 ``[len(rows), H, kv_len, D]``。
         """
+        del cache_kwargs
+        rows = self._rows
         n = len(rows)
         b, h, length, d = k.shape
         assert b == n and length == self._new_len, (
@@ -141,8 +164,10 @@ class PaddedKVCache:
         kv_len = int(self.lens[idx].max()) + length
         return kk[idx][:, :, :kv_len], vv[idx][:, :, :kv_len]
 
-    def mask(self, rows: list[int], kv_len: int, q_len: int) -> torch.Tensor:
-        """additive attention mask ``[len(rows), 1, q_len, kv_len]``。"""
+    def mask(self, q_len: int) -> torch.Tensor:
+        """additive attention mask ``[B, 1, q_len, kv_len]``（B = 本步参与行数）。"""
+        rows = self._rows
+        kv_len = self._kv_len
         idx = torch.tensor(rows, dtype=torch.long, device=self.device)
         valid = self.valid[idx][:, :kv_len]
         additive = torch.zeros(
@@ -153,9 +178,9 @@ class PaddedKVCache:
         )
         return additive.expand(len(rows), 1, q_len, kv_len)
 
-    def crop(self, rows: list[int], seg_rows: list[int]) -> None:
+    def crop(self) -> None:
         """块内候选的 KV 用完即弃（上游 ``crop(start)`` 的批量化版本）。"""
-        assert len(rows) == len(seg_rows)
+        rows, seg_rows = self._rows, self._seg_rows
         positions = torch.arange(self.max_len, device=self.device)
         for r, seg in zip(rows, seg_rows):
             keep = int(self.lens[r]) + seg
