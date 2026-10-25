@@ -298,6 +298,34 @@ num_cached_tokens` 保证**永不读到**越界位置，下次写同一 slot 时
 
 `loader.py` 已加启动告警：transformers < 5 时打印上面这段结论，避免静默降级。
 
+### 6.5 结论：以 transformers 5.10.2 为正式环境（方案 A）
+
+同 20 条 gsm8k（seed 980406，n=128，T=0，k=7），四组对照：
+
+| 配置 | accept_len | @0 | @3 | @6 |
+|---|---|---|---|---|
+| 官方 DeepSpec（BF16，5.10.2） | 6.26 | 0.938 | 0.745 | 0.578 |
+| **我们（FP8，5.10.2 + torch 2.6）** | **6.538** | 0.950 | 0.785 | 0.629 |
+| 我们（FP8，4.57.6） | 5.532 | 0.938 | 0.662 | 0.328 |
+| 我们（BF16，4.57.6） | 5.429 | 0.948 | 0.636 | 0.324 |
+
+- 5.10 下**达到/略超官方**（6.538 ≥ 6.26），逐位置也全面不低于官方 → 草稿接入正确；
+- 探针在 5.10 下 `block_hidden max|diff| = 0.25`（torch 2.6 vs 2.9 的数值差，rel 0.93%），
+  **tokens 逐位相同**；
+- 之前 4.57 的 33% 差异确认为 transformers 版本所致。
+
+**环境改动（很小，torch/flash-attn/flashinfer 全不动）**：
+
+```
+transformers==5.10.2
+huggingface_hub==1.33.0
++ float8_e8m0fnu 垫片（transformers 5.x import 期引用 torch 2.8+ 的 dtype 常量）
+  → 已内置：src/_compat.py，由 src/__init__.py 首行自动安装
+```
+
+**由此得出的判据更新**：`accept_len ≥ 基线 90%` **已达成（104%）**，线性验证已吃满
+草稿质量 → **树形验证不做**，力气转到 batch>1。
+
 ### 6.5 尚未做
 
 **vLLM 同机基线**（acceptance length / decode tok/s）——租机时补一次，作为 Phase 3

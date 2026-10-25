@@ -5,6 +5,12 @@ from __future__ import annotations
 import importlib
 from typing import TYPE_CHECKING, Any
 
+# 必须在任何 transformers import 之前：transformers 5.x 会引用 torch 2.8+ 才有的
+# dtype 常量（我们环境是 torch 2.6），详见 src/_compat.py
+from ._compat import install_transformers_shims
+
+install_transformers_shims()
+
 __all__ = ["Engine", "EngineConfig", "SamplingParams"]
 
 if TYPE_CHECKING:
