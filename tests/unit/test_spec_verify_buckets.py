@@ -34,6 +34,30 @@ class TestVerifyGraphBounds:
     def test_bounds(self, cap, want):
         assert _bounds(cap) == want
 
+    def test_graph_plan_bounds_combinations(self):
+        """分档计划必须只随 max_num_seqs 线性增长，不能爆炸。
+
+        bs=1 铺全部 m（草稿数可变）；bs>1 只录 m=k+1（每条序列提满 k 个）。
+        """
+
+        def plan(spec_tokens: int, max_num_seqs: int) -> list[tuple[int, int]]:
+            fake = SimpleNamespace(
+                config=SimpleNamespace(
+                    spec_tokens=spec_tokens, max_num_seqs=max_num_seqs
+                )
+            )
+            return ModelRunner._verify_graph_plan(fake)
+
+        # k=7：bs=1 有 m=2..8 共 7 个；bs=2..4 各 1 个
+        p = plan(7, 4)
+        assert len(p) == 7 + 3
+        assert (1, 8) in p and (4, 8) in p
+        assert (2, 3) not in p, "bs>1 只录 m=k+1"
+
+        # 组合数 = (k) + (max_num_seqs-1)，与桶数相乘后仍然可控
+        assert len(plan(7, 1)) == 7
+        assert len(plan(4, 8)) == 4 + 7
+
     def test_sorted_and_unique(self):
         b = _bounds(2048)
         assert b == sorted(set(b))

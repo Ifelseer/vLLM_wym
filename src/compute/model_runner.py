@@ -269,27 +269,31 @@ class ModelRunner:
                 )
         torch.cuda.synchronize(self.device)
 
-    def _fake_verify_batch(self, m: int, cached: int = 8) -> None:
-        """构造一行假 verify 批（m 个 token、页表指向 page 0）。"""
-        vseq = SeqSchedule(
-            seq_id=-1,
-            block_table=[0],
-            num_cached_tokens=cached,
-            token_ids=[1] * m,
-        )
-        self.batch.build_prefill([vseq])
+    def _fake_verify_batch(self, bs: int, m: int, cached: int) -> None:
+        """构造 bs 行假 verify 批（每行 m 个 token、页表指向 page 0）。"""
+        vseqs = [
+            SeqSchedule(
+                seq_id=-1 - i,
+                block_table=[0],
+                num_cached_tokens=cached,
+                token_ids=[1] * m,
+            )
+            for i in range(bs)
+        ]
+        self.batch.build_prefill(vseqs)
 
-    def _verify_body(self, m: int, max_k: int):
+    def _verify_body(self, bs: int, m: int, max_k: int):
         """verify 的可录图部分：只含模型前向，输出拷进静态缓冲。"""
+        n_tokens = bs * m
         with attention_context(self._meta):
             out = self.model(
-                self.batch.input_ids[:m],
-                self.batch.positions[:m],
-                self._prefill_attn(1, m, m, max_k, True),
+                self.batch.input_ids[:n_tokens],
+                self.batch.positions[:n_tokens],
+                self._prefill_attn(bs, n_tokens, m, max_k, True),
                 None,
-                self._ensure_aux(m),
+                self._ensure_aux(n_tokens),
             )
-        self._verify_out[:m].copy_(out)
+        self._verify_out[:n_tokens].copy_(out)
         return out
 
     def _verify_graph_bounds(self) -> list[int]:
@@ -303,6 +307,22 @@ class ModelRunner:
         bounds = [b for b in (256, 512, 1024, 2048) if b < cap]
         bounds.append(cap)
         return sorted(set(bounds))
+
+    def _verify_graph_plan(self) -> list[tuple[int, int]]:
+        """要录哪些 ``(bs, m)`` 组合。
+
+        bs=1 覆盖全部 m（草稿数可变）；bs>1 只覆盖 ``m = k+1``——即"每条序列
+        都提满 k 个"，这是 dspark 的常态。ngram 的 m 逐序列变化，multi-batch 下
+        没有对应图，会回退 eager。
+
+        为什么不对 bs>1 也铺全部 m：组合数是 ``bs × (k+1) × 桶``，k=7、bs=8、
+        4 个桶就是 224 张图，capture 时间与池内存都不划算。
+        """
+        k_plus_1 = self.config.spec_tokens + 1
+        plan = [(1, m) for m in range(2, k_plus_1 + 1)]
+        for bs in range(2, self.config.max_num_seqs + 1):
+            plan.append((bs, k_plus_1))
+        return plan
 
     @torch.inference_mode()
     def _capture_verify_graphs(self) -> None:
@@ -323,10 +343,11 @@ class ModelRunner:
             print("[WARN] spec_verify_graph 需要 pp_size == 1，已回退 eager verify")
             return
         buckets = self._verify_graph_bounds()
-        graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
+        graphs: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}
         # 所有 verify 图共用同一个显存池：图内的临时张量可以互相复用，
-        # 否则「桶数 × (k+1)」张图各自持有池会线性吃显存。
+        # 否则「桶数 × 批数 × m」张图各自持有池会线性吃显存。
         pool = torch.cuda.graph_pool_handle()
+        plan = self._verify_graph_plan()
         try:
             self._verify_out = torch.empty(
                 self.config.max_num_batched_tokens,
@@ -335,15 +356,17 @@ class ModelRunner:
                 device=self.device,
             )
             for bound in buckets:
-                for m in range(2, self.config.spec_tokens + 2):
+                for bs, m in plan:
+                    if bs * m > self.config.max_num_batched_tokens:
+                        continue
                     # 假批只负责把形状/指针摆好；cached 取到桶满，
                     # 让 cu_seqlens_k 正好等于该桶的上界（kernel 参数一致）
-                    self._fake_verify_batch(m, cached=max(1, bound - m))
-                    self._verify_body(m, bound)  # 图外 warmup：初始化 / autotune
+                    self._fake_verify_batch(bs, m, cached=max(1, bound - m))
+                    self._verify_body(bs, m, bound)  # 图外 warmup：初始化 / autotune
                     g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(g, pool=pool):
-                        self._verify_body(m, bound)
-                    graphs[(m, bound)] = g
+                        self._verify_body(bs, m, bound)
+                    graphs[(bs, m, bound)] = g
             torch.cuda.synchronize(self.device)
         except Exception as exc:  # noqa: BLE001 - 录图失败要能整体降级
             print(
@@ -597,12 +620,14 @@ class ModelRunner:
                 self.batch.cu_seqlens_k[: n + 1],
                 self.batch.block_tables[:n],
             )
-        # 图只用单序列：多序列的组合是 (bs, 每序列 m)，可能性爆炸；v1 回退 eager。
+        # 图要求「每条序列的 m 相同」：bs=1 覆盖全部 m，bs>1 只录了 m=k+1
+        # （dspark 的常态）。m 逐序列不等（ngram 常见）就回退 eager。
         graph = None
-        if n == 1:
-            need = per[0][0].num_cached_tokens + ms[0]
+        if len(set(ms)) == 1:
+            m0 = ms[0]
+            need = max(s.num_cached_tokens for s, _ in per) + m0
             for bound in self._verify_buckets:
-                cand = self._verify_graphs.get((ms[0], bound))
+                cand = self._verify_graphs.get((n, m0, bound))
                 if cand is not None and need <= bound:
                     graph = cand
                     break
