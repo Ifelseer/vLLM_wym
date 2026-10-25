@@ -14,6 +14,8 @@
 | [quantization-bench.md](quantization-bench.md) | 单卡 Qwen3-8B batch-8 量化基准：BF16 / FP8 / INT8 的 TTFT、吞吐、显存对比与成因分析 |
 | [dspark-plan.md](dspark-plan.md) | DSpark 投机解码实施计划：三项决策、五阶段范围、验收口径与风险清单 |
 | [dspark-spec.md](dspark-spec.md) | DSpark 上游规格核实：草稿结构/权重名/推理协议/精确配置，以及与本引擎的落差 |
+| [dspark-report.md](dspark-report.md) | **DSpark 落地报告**：架构决策、七个坑的根因、性能与官方对照、方法论沉淀、剩余工作 |
+| [dspark-reference-eval.md](dspark-reference-eval.md) | 用官方 DeepSpec eval 作 accept_len 参照：独立 venv、任务裁剪、口径对齐 |
 
 ## 代码地图
 
