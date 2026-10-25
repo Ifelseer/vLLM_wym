@@ -100,6 +100,8 @@ class EngineConfig:
     # 必须与草稿 checkpoint 的 `target_layer_ids` 一致；Phase 3 加载草稿时会断言。
     # 默认值是官方 `dspark_qwen3_8b_block7` 的取值。
     spec_target_layer_ids: tuple[int, ...] = (1, 9, 17, 25, 33)
+    # DSpark 草稿 checkpoint 目录（spec_draft="dspark" 时必填）
+    spec_draft_model: str = ""
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
@@ -150,6 +152,20 @@ class EngineConfig:
                 if not self.spec_target_layer_ids:
                     raise ValueError(
                         "spec_target_layer_ids must not be empty for dspark"
+                    )
+                # 草稿模型 v1 不做 TP 切分（4.5GB 单卡放得下），显式拒绝而不是
+                # 静默只让 rank0 起草（那会让其余 rank 空转并错位）
+                if self.tp_size > 1:
+                    raise ValueError("spec_draft='dspark' requires tp_size == 1 in v1")
+                self.spec_draft_model = os.path.expanduser(self.spec_draft_model)
+                if not self.spec_draft_model:
+                    raise ValueError(
+                        "spec_draft='dspark' requires spec_draft_model "
+                        "(path to dspark_qwen3_8b_block7)"
+                    )
+                if not os.path.isdir(self.spec_draft_model):
+                    raise FileNotFoundError(
+                        f"draft model path not found: {self.spec_draft_model}"
                     )
         if self.spec_tie_eps < 0:
             raise ValueError(f"spec_tie_eps must be >= 0, got {self.spec_tie_eps}")

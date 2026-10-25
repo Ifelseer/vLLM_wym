@@ -23,15 +23,32 @@ from .ngram import NgramDrafter
 __all__ = ["Drafter", "NgramDrafter", "make_drafter"]
 
 
+class _WorkerSideDrafter:
+    """标记：草稿由 **worker** 产出（GPU 草稿模型），调度器只做额度预留。
+
+    DSpark 的草稿需要目标模型的 aux hidden、自己的 KV cache 和 GPU 前向，无法在
+    调度器（CPU 侧）产出。所以调度器退化为"按上限预留"：``write = 1 + k``，
+    块分配幂等，实际写几位由 worker 回报的 ``d_lens`` 决定。
+
+    ``propose()`` 永远返回空——真实的草稿在 ``ModelRunner._propose_dspark`` 里。
+    """
+
+    worker_side = True
+
+    def propose(self, seq, k: int) -> list[int]:  # noqa: ARG002 - 接口兼容
+        return []
+
+
 def make_drafter(name: str, *, num_spec_tokens: int) -> Drafter:
     """按配置名构造草稿器。
 
     - ``ngram``：后缀匹配（无模型，Phase 1 的验证替身）
-    - ``dspark``：Phase 3 接入（此处显式报错，避免静默退化）
+    - ``dspark``：worker 侧 GPU 草稿（本函数只返回一个预留标记）
     """
     if name == "ngram":
         return NgramDrafter(max_tokens=num_spec_tokens)
+    if name == "dspark":
+        return _WorkerSideDrafter()
     raise NotImplementedError(
-        f"spec draft {name!r} is not implemented yet "
-        "(only 'ngram' is available; 'dspark' lands in Phase 3)"
+        f"spec draft {name!r} is not implemented (ngram|dspark)"
     )

@@ -84,8 +84,16 @@ class TestNgramDrafter:
     def test_factory(self):
         assert isinstance(make_drafter("ngram", num_spec_tokens=4), NgramDrafter)
         assert isinstance(NgramDrafter(), Drafter)  # runtime_checkable Protocol
+
+    def test_dspark_factory_is_worker_side_marker(self):
+        """dspark 的草稿在 worker 侧产出：调度器只拿一个"预留额度"标记。"""
+        marker = make_drafter("dspark", num_spec_tokens=4)
+        assert getattr(marker, "worker_side", False) is True
+        assert marker.propose(None, 4) == []
+
+    def test_unknown_draft_raises(self):
         with pytest.raises(NotImplementedError):
-            make_drafter("dspark", num_spec_tokens=4)
+            make_drafter("medusa", num_spec_tokens=4)
 
 
 # ---------------------------------------------------------------- #

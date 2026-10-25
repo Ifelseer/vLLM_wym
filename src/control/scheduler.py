@@ -77,6 +77,9 @@ class Scheduler:
         k = min(k, self.max_num_batched_tokens - tokens_used - 1)
         if k <= 0:
             return [], 1
+        if getattr(self.drafter, "worker_side", False):
+            # 草稿在 worker 侧产出：这里只按上限预留位置/块
+            return [], 1 + k
         drafts = self.drafter.propose(seq, k)[:k]
         self.spec_stats["proposed"] += len(drafts)
         return drafts, 1 + len(drafts)

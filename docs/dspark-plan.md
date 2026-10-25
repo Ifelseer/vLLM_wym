@@ -221,9 +221,18 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 >   `ModelRunner._ensure_aux()` 懒分配 `[max_num_batched_tokens, 5*hidden]`，并只在
 >   `_run_prefill` / `_run_verify` 传参。**DSpark 模式强制每次走 verify（eager）**，
 >   因此完全不碰 decode CUDA Graph——这是我原本最担心的回归面，现在被绕开了。
-> - 仍未做：`DSparkDrafter` 接入 `Drafter` 接口（草稿需要 GPU，接口要从"调度器侧纯
->   CPU 函数"改成"worker 侧组件"）、草稿 KV 的追加/回滚（规则见
->   [dspark-spec.md](dspark-spec.md) §6.3）。
+> - **草稿器已落地并接线**（`src/spec/dspark/drafter.py`）：按上游协议维护每序列的
+>   草稿 KV（propose 时"追加上一步 context 段 + block 个候选 → `crop(start)`"），
+>   位置区间 `[cached, start+block)` 与上游逐行对应。**KV 长度恒等于已提交长度**
+>   这条不变量用 CPU 随机权重单测钉住（7 项，含三步连续、账本漂移放弃起草、
+>   温度下返回归一化草稿分布）。
+> - 接口形态：`Drafter` 出现两种实现——`ngram` 是调度器侧纯 CPU 函数，`dspark`
+>   返回一个 `worker_side` 标记，调度器只按上限预留 `1+k` 个位置/块，真实草稿由
+>   `ModelRunner._propose_dspark()` 产出并直接进 verify。
+> - 仍未做：**4090 上的端到端验收**（需要真实 checkpoint）。要验的不变量：
+>   同一段 token 由「prefill(5)」与「prefill(3)+verify(2)」得到的 aux hidden
+>   必须逐位相同（aux 是逐位置量，不该随批组成变化），以及 greedy 逐位一致 /
+>   acceptance length ≥ vLLM 基线 90%。
 
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 

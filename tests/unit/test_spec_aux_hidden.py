@@ -47,6 +47,7 @@ def _cfg(model_dir: str, **kw) -> EngineConfig:
         max_num_seqs=1,
         spec_tokens=4,
         spec_draft="dspark",
+        spec_draft_model=model_dir,  # 只校验是目录，不校验内容
     )
     base.update(kw)
     return EngineConfig(**base)
@@ -62,12 +63,29 @@ class TestDsparkConfig:
         with pytest.raises(ValueError, match="pp_size == 1"):
             _cfg(model_dir, pp_size=2)
 
+    def test_requires_single_tp(self, model_dir):
+        with pytest.raises(ValueError, match="tp_size == 1"):
+            _cfg(model_dir, tp_size=2)
+
     def test_requires_layer_ids(self, model_dir):
         with pytest.raises(ValueError, match="spec_target_layer_ids"):
             _cfg(model_dir, spec_target_layer_ids=())
 
+    def test_requires_draft_model(self, model_dir):
+        with pytest.raises(ValueError, match="spec_draft_model"):
+            _cfg(model_dir, spec_draft_model="")
+
+    def test_missing_draft_dir(self, model_dir):
+        with pytest.raises(FileNotFoundError, match="draft model path not found"):
+            _cfg(model_dir, spec_draft_model=str(model_dir) + "-nope")
+
     def test_ngram_does_not_need_layer_ids(self, model_dir):
-        cfg = _cfg(model_dir, spec_draft="ngram", spec_target_layer_ids=())
+        cfg = _cfg(
+            model_dir,
+            spec_draft="ngram",
+            spec_target_layer_ids=(),
+            spec_draft_model="",
+        )
         assert cfg.spec_draft == "ngram"
 
     def test_spec_off_by_default(self, model_dir):

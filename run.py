@@ -71,6 +71,7 @@ DEFAULTS = {
     "spec_tokens": 0,
     "spec_draft": "ngram",
     "spec_tie_eps": 0.0,
+    "spec_draft_model": "",
 }
 
 
@@ -109,6 +110,7 @@ def _make_engine(cfg: dict) -> Engine:
             spec_tokens=int(cfg.get("spec_tokens", 0)),
             spec_draft=cfg.get("spec_draft", "ngram"),
             spec_tie_eps=float(cfg.get("spec_tie_eps", 0.0)),
+            spec_draft_model=cfg.get("spec_draft_model", ""),
         )
     )
 
@@ -288,6 +290,11 @@ def main() -> None:
         "decode 内核重算，保证与 baseline 逐位一致",
     )
     p.add_argument(
+        "--spec-draft-model",
+        default=None,
+        help="DSpark 草稿 checkpoint 目录（spec-draft=dspark 时必填）",
+    )
+    p.add_argument(
         "--pp-layer-counts",
         type=str,
         default=None,
@@ -352,6 +359,8 @@ def main() -> None:
         cfg["spec_draft"] = args.spec_draft
     if args.spec_tie_eps is not None:
         cfg["spec_tie_eps"] = args.spec_tie_eps
+    if args.spec_draft_model is not None:
+        cfg["spec_draft_model"] = args.spec_draft_model
 
     if args.batch:
         run_batch(cfg)

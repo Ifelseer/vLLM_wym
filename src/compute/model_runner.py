@@ -57,6 +57,10 @@ class ModelRunner:
         self.hidden_size = config.hf_config.hidden_size
         # DSpark 的 aux hidden 缓冲（懒分配；关闭投机时恒为 None）
         self._aux_buf: torch.Tensor | None = None
+        # DSpark 草稿器（懒加载草稿模型）与每个序列的待追加 context 段
+        self._dspark = None
+        self._dspark_pending: dict[int, torch.Tensor] = {}
+        self._draft_probs: torch.Tensor | None = None
         self._meta = AttnMetadata(kv_cache=self.kv_cache)
 
         pp = get_pp_group()
@@ -283,6 +287,10 @@ class ModelRunner:
     def _run_decode(self, seqs: list[SeqSchedule]):
         if not seqs:
             return None
+        if self.config.spec_tokens > 0 and self.config.spec_draft == "dspark":
+            # DSpark 每步都走 verify（eager 的 prefill 通路）：草稿需要它产出的
+            # aux hidden，同时这条路径完全不进 decode CUDA Graph。
+            return self._run_verify(seqs, drafts=self._propose_dspark(seqs))
         if self.config.spec_tokens > 0 and any(s.draft_ids for s in seqs):
             return self._run_verify(seqs)
         bs = len(seqs)
@@ -353,10 +361,52 @@ class ModelRunner:
             raise ValueError(
                 f"aux buffer too small: need {n_tokens} > {self._aux_buf.shape[0]}"
             )
+        # 顺手把草稿模型也加载好：prefill 结束就要把整段 prompt 的 context 交给它
+        self._ensure_dspark()
         return self._aux_buf[:n_tokens]
 
+    def _ensure_dspark(self):
+        """懒加载草稿模型并校验它与 config 的层表一致。"""
+        if self.config.spec_tokens <= 0 or self.config.spec_draft != "dspark":
+            return None
+        if self._dspark is None:
+            from ..spec.dspark.drafter import DSparkDrafter
+            from ..spec.dspark.loader import load_dspark_draft
+
+            draft = load_dspark_draft(
+                self.config.spec_draft_model, device=self.device, dtype=self.dtype
+            )
+            want = list(self.config.spec_target_layer_ids)
+            got = list(draft.target_layer_ids)
+            if got != want:
+                raise ValueError(
+                    f"draft target_layer_ids {got} != config {want}; "
+                    "两边必须一致，否则喂给草稿的 context 特征顺序会错位"
+                )
+            self._dspark = DSparkDrafter(draft, device=self.device)
+        return self._dspark
+
+    def _propose_dspark(self, seqs: list[SeqSchedule]) -> list[int]:
+        """worker 侧起草：用上一步验证出的 context 段 + anchor 出 k 个候选。"""
+        dr = self._ensure_dspark()
+        if dr is None or len(seqs) != 1:
+            return []
+        s = seqs[0]
+        first = self._dspark_pending.pop(s.seq_id, None)
+        self._draft_probs = None
+        tokens, probs = dr.propose(
+            s.seq_id,
+            anchor_token_id=s.token_ids[-1],
+            start=s.num_cached_tokens,
+            first_ctx=first,
+        )
+        self._draft_probs = probs
+        return tokens
+
     @torch.inference_mode()
-    def _run_verify(self, seqs: list[SeqSchedule]) -> "_SpecSamples | None":
+    def _run_verify(
+        self, seqs: list[SeqSchedule], drafts: list[int] | None = None
+    ) -> "_SpecSamples | None":
         """投机验证：一次因果前向算出 ``[anchor] + drafts`` 全部位置的 logits。
 
         greedy 接受规则：位置 ``p+i`` 的 argmax 预测的是 ``p+i+1`` 的 token，
@@ -374,7 +424,7 @@ class ModelRunner:
         """
         assert len(seqs) == 1, "v1 speculative decode supports a single sequence"
         s = seqs[0]
-        drafts = list(s.draft_ids)
+        drafts = list(s.draft_ids if drafts is None else drafts)
         m = 1 + len(drafts)
 
         vseq = SeqSchedule(
@@ -424,9 +474,22 @@ class ModelRunner:
         elif self.is_driver:
             # 温度采样：用**采样器实际使用的分布**（含 top-k/p/min-p 截断）做
             # 拒绝采样，才能保证输出分布与普通采样逐位一致。
+            draft_probs = self._draft_probs
+            if draft_probs is not None and draft_probs.shape[0] != len(drafts):
+                draft_probs = None  # 草稿被截断 → 退回 one-hot 语义
             toks, accepted = accept_rejection(
-                drafts, self._verify_probs(logits), None
+                drafts, self._verify_probs(logits), draft_probs
             )
+
+        if self._dspark is not None and self._aux_buf is not None and self.is_driver:
+            # 草稿侧账本：本次验证通过的位置 p..p+accepted 的 hidden 就是下一步
+            # 要追加的 context 段（上游 `_update` 同款，取 [:accepted+1]）
+            self._dspark.update(
+                s.seq_id,
+                self._aux_buf[: accepted + 1].clone(),
+                start=s.num_cached_tokens + 1 + accepted,
+            )
+        self._draft_probs = None
 
         if not self.is_driver:
             return _SpecSamples()
@@ -598,6 +661,17 @@ class ModelRunner:
                     it,
                     aux,
                 )
+
+        if (
+            self._dspark is not None
+            and self._aux_buf is not None
+            and len(seqs) == 1
+            and seqs[0].num_cached_tokens == 0
+            and seqs[0].need_sample
+        ):
+            # 首步的 context = 整段 prompt 的 aux hidden。只在"单 chunk、从头开始"
+            # 时记录；chunked prefill 下不做草稿（v1 取舍，正确性不受影响）。
+            self._dspark_pending[seqs[0].seq_id] = self._aux_buf[:n_tokens].clone()
 
         if not self.is_last_pp:
             self._send_intermediate(hidden)
