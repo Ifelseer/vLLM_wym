@@ -64,6 +64,17 @@ class Scheduler:
             "proposed": 0,
             "accepted": 0,
         }
+        # 逐位置接受率：第 i 位"被提出"= 本步草稿数 > i；"被接受"= 接受数 > i。
+        # 上游 eval 也统计这两个，用来判断草稿是在块内第几位开始失效。
+        self.spec_pos_proposed: list[int] = [0] * self.spec_tokens
+        self.spec_pos_accepted: list[int] = [0] * self.spec_tokens
+
+    def spec_position_rates(self) -> list[float | None]:
+        """返回逐位置接受率（长度 = spec_tokens，未提出的位置为 None）。"""
+        return [
+            (a / p if p else None)
+            for a, p in zip(self.spec_pos_accepted, self.spec_pos_proposed)
+        ]
 
     def _propose(self, seq: Sequence, tokens_used: int) -> tuple[list[int], int]:
         """产出本步草稿并算出要写入的位置数（1 = 无草稿的普通 decode）。"""
@@ -276,6 +287,17 @@ class Scheduler:
                 continue
 
             accepted = max(0, len(toks) - 1)
+            # 本步提出的草稿数：worker 侧起草看 d_proposed，ngram 看调度时的
+            # num_scheduled_tokens-1（此时还没被下面的落账覆盖）
+            n_prop = (
+                int(d_proposed[i])
+                if d_proposed is not None and i < len(d_proposed)
+                else max(0, seq.num_scheduled_tokens - 1)
+            )
+            for pos in range(min(n_prop, len(self.spec_pos_proposed))):
+                self.spec_pos_proposed[pos] += 1
+            for pos in range(min(accepted, len(self.spec_pos_accepted))):
+                self.spec_pos_accepted[pos] += 1
             self.spec_stats["steps"] += 1
             self.spec_stats["accepted"] += accepted
             if d_proposed is not None and i < len(d_proposed):

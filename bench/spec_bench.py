@@ -113,6 +113,7 @@ def _run_one(
 
         peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
         stats = dict(eng.scheduler.spec_stats)
+        pos_rates = eng.scheduler.spec_position_rates()
         e2e = statistics.mean(e2es)
         ttft = statistics.mean(ttfts)
         decode_s = max(e2e - ttft / 1e3, 1e-6)
@@ -133,6 +134,9 @@ def _run_one(
                 stats["accepted"] / stats["proposed"] if stats["proposed"] else float("nan")
             ),
             "accept_len": (stats["accepted"] + stats["steps"]) / steps,
+            # 逐位置接受率：诊断"草稿在块内第几位开始失效"用，比 accept_len
+            # 单个数字有信息量（上游 eval 也统计这个）
+            "pos_rates": pos_rates,
             "tokens": outs[-1],
         }
     finally:
@@ -252,6 +256,12 @@ def main() -> None:
         )
     print()
     print(f"decode 加速比: {speedup:.3f}x（k={args.spec_tokens}，上限 {args.spec_tokens + 1}x）")
+    rates = spec.get("pos_rates") or []
+    if rates:
+        print("逐位置接受率：", "  ".join(
+            f"@{i} {'—' if r is None else f'{r:.3f}'}" for i, r in enumerate(rates)
+        ))
+
     if args.temperature <= 1e-5:
         print(f"greedy 逐 token 一致率: {match:.1%}" + ("" if match == 1.0 else "  ← 必须 100%，否则是 bug"))
     else:

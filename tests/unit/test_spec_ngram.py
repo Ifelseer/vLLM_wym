@@ -266,6 +266,24 @@ class TestSchedulerSpec:
         s.update(ScheduledBatch(decodes=[seq2]), [], [7], [1])
         assert s.spec_stats["proposed"] == 4
 
+    def test_position_rates_worker_side(self):
+        """dspark：提出 4 个、接受 2 个 → @0/@1 为 1.0，@2/@3 为 0。"""
+        s = _scheduler(spec_tokens=4)
+        seq = _seq(list(range(6)), cached=5)
+        s.update(ScheduledBatch(decodes=[seq]), [], [1, 2, 900], [3], [4])
+        assert s.spec_position_rates() == [1.0, 1.0, 0.0, 0.0]
+
+    def test_position_rates_scheduler_side(self):
+        """ngram：没有 d_proposed，靠 num_scheduled_tokens-1 反推提出数。
+
+        提出 2 个、接受 1 个 → @0=1.0、@1=0.0、@2/@3 未提出（None）。
+        """
+        s = _scheduler(spec_tokens=4)
+        seq = _seq(list(range(6)), cached=5)
+        seq.num_scheduled_tokens = 3
+        s.update(ScheduledBatch(decodes=[seq]), [], [7, 8], [2])
+        assert s.spec_position_rates() == [1.0, 0.0, None, None]
+
     def test_no_spec_keeps_old_behaviour(self):
         """spec_tokens=0 时必须走原来的一 token 路径。"""
         s = _scheduler(spec_tokens=0)
