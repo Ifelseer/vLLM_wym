@@ -44,6 +44,12 @@ wandb/
 outputs/
 checkpoints/
 
+# --- bench 输出（本地测量结果，不入库）---
+/fp8_*.json
+/spec*.json
+/b*-*.json
+/*_verify.json
+
 # --- 本地 Agent 工作目录（含临时笔记 / 简历素材，不入库）---
 .workbuddy/
 .codebuddy/

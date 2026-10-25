@@ -879,19 +879,22 @@ class ModelRunner:
                     aux,
                 )
 
-        if (
-            self._dspark is not None
-            and self._aux_buf is not None
-            and len(seqs) == 1
-            and seqs[0].num_cached_tokens == 0
-            and seqs[0].need_sample
-        ):
-            # 首步的 context = 整段 prompt 的 aux hidden。只在"单 chunk、从头开始"
-            # 时记录；chunked prefill 下不做草稿（v1 取舍，正确性不受影响）。
-            # 草稿模型的 target_hidden_states 约定是 [1, n, F]（带 batch 维）
-            self._dspark_pending[seqs[0].seq_id] = (
-                self._aux_buf[:n_tokens].clone().unsqueeze(0)
-            )
+        if self._dspark is not None and self._aux_buf is not None:
+            # 逐序列切 aux：prefill 把 bs 条序列拼平成一段，第 i 条占
+            # [off, off+len(token_ids))。**必须逐序列做**——多序列 prefill 时
+            # 只看 seqs[0] 会让其余序列拿不到 first_ctx，草稿器直接返回空
+            # （表现：b>1 时 accept_len 恒为 1，一条草稿都没提）。
+            off = 0
+            for s in seqs:
+                n_i = len(s.token_ids)
+                if s.need_sample and s.num_cached_tokens == 0:
+                    # 首步 context = 整段 prompt 的 aux hidden；只在"单 chunk、
+                    # 从头开始"时记录（chunked prefill 下不做草稿，正确性不受影响）。
+                    # 草稿模型约定 target_hidden_states 是 [1, n, F]（带 batch 维）
+                    self._dspark_pending[s.seq_id] = (
+                        self._aux_buf[off : off + n_i].clone().unsqueeze(0)
+                    )
+                off += n_i
 
         if not self.is_last_pp:
             self._send_intermediate(hidden)
