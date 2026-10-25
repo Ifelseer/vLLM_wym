@@ -271,7 +271,34 @@ num_cached_tokens` 保证**永不读到**越界位置，下次写同一 slot 时
 不是 `num_cached_tokens + 1`——多算一个会把 anchor 重复计入（上游已把 anchor 作为
 块的第 0 个位置喂进去）。
 
-### 6.4 尚未做
+### 6.4 环境依赖：transformers 5.x 对接受率是硬要求（2026-10-25 定位）
+
+用 `tools/dspark_draft_probe.py`（同一 ctx/anchor，不带目标模型）对拍：
+
+| 组合 | block_hidden | base_logits argmax | tokens |
+|---|---|---|---|
+| ours(5.10) vs theirs(5.10) | **0** | 完全一致 | **完全一致** |
+| ours(4.57) vs theirs(5.10) | rel **33%** | 从第 2 位起不同 | 完全分叉 |
+
+结论：**vendored 代码与上游功能一致**（同 venv 下逐位相等），差异来自 4.57 与 5.10
+的 Qwen3 组件行为——草稿仍借用 transformers 的 `Qwen3RotaryEmbedding` 与
+`sdpa_attention_forward`。
+
+影响面：**不影响正确性**（草稿永远被目标模型验证，错的草稿只会被拒），但接受率
+明显偏低（`accept_len` 5.53/5.43 vs 官方 6.26，即 88%/87%）。
+
+两条出路：
+
+1. **要求 transformers ≥ 5.0**（最简单）；租机因 `torch 2.6.0a0` 被判版本过低而
+   无法升到 5.x，需要换 torch 或打补丁；
+2. **自研 RoPE + 直接调 `torch.nn.functional.scaled_dot_product_attention`**，
+   彻底不依赖 transformers 的内部组件——顺带把 vendor 时的 8 个符号依赖砍到
+   3 个（`Qwen3MLP`/`Qwen3RMSNorm`/`Qwen3PreTrainedModel`），是把"版本脆弱性"
+   一次性解决的做法。
+
+`loader.py` 已加启动告警：transformers < 5 时打印上面这段结论，避免静默降级。
+
+### 6.5 尚未做
 
 **vLLM 同机基线**（acceptance length / decode tok/s）——租机时补一次，作为 Phase 3
 验收的对照口径；目前只有本引擎 baseline（Qwen3-8B greedy 59.9 tok/s）。

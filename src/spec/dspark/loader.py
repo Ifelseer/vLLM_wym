@@ -72,6 +72,34 @@ def check_transformers_symbols() -> list[str]:
     return missing
 
 
+def warn_if_degraded_transformers() -> str | None:
+    """transformers < 5 时草稿的数值与上游不一致，acceptance 会明显偏低。
+
+    实测（2026-10-25）：同一份 vendored 代码、同一份 ctx/anchor，
+
+    - transformers 5.10：hidden 与 tokens 与上游**完全相等**；
+    - transformers 4.57：block_hidden 相对误差 33%，从第 2 个草稿位置起分叉。
+
+    原因是草稿模型仍借用 transformers 的 Qwen3 组件（RotaryEmbedding /
+    sdpa_attention_forward），这两个在 4.x→5.x 之间行为变了。**不影响正确性**
+    （草稿永远被目标模型验证），只影响接受率（实测 accept_len 5.53 vs 6.26）。
+
+    返回告警文本（未触发时为 None），由调用方打印。
+    """
+    import transformers
+
+    major = int(transformers.__version__.split(".")[0])
+    if major >= 5:
+        return None
+    return (
+        f"[WARN] transformers {transformers.__version__} < 5：DSpark 草稿的数值"
+        "与上游实现不一致（实测 block_hidden rel 33%），accept_len 会明显偏低"
+        "（约 5.5 vs 6.26）。草稿仍被验证，输出正确性不受影响；要拿到论文量级的"
+        "接受率需 transformers>=5，或改用自带的 RoPE/attention 实现"
+        "（见 docs/dspark-spec.md §7）。"
+    )
+
+
 def assert_transformers_ready() -> None:
     import transformers
 
@@ -109,6 +137,9 @@ def load_dspark_draft(
     只用于训练（需要 block mask），推理不要开。
     """
     assert_transformers_ready()
+    warning = warn_if_degraded_transformers()
+    if warning is not None:
+        print(warning, flush=True)
     kwargs = {
         "attn_implementation": attn_implementation,
         "low_cpu_mem_usage": True,
