@@ -339,7 +339,8 @@ class ModelRunner:
         缓冲一次分配、按 ``n_tokens`` 切片传入；前向里用 ``out=`` **原地写入**
         （不新建中间张量），所以地址固定，将来若要进 CUDA Graph 也不用改。
         """
-        if self.config.spec_tokens <= 0 or self.config.spec_draft != "dspark":
+        wants_aux = self.config.spec_draft == "dspark" or self.config.spec_aux_hidden
+        if self.config.spec_tokens <= 0 or not wants_aux:
             return None
         if self._aux_buf is None:
             ids = list(self.config.spec_target_layer_ids)

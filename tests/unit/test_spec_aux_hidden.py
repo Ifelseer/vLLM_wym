@@ -88,6 +88,17 @@ class TestDsparkConfig:
         )
         assert cfg.spec_draft == "ngram"
 
+    def test_aux_hidden_requires_spec(self, model_dir):
+        """aux 采集是投机的副产物：没有 spec_tokens 就没有 verify 前向可采。"""
+        with pytest.raises(ValueError, match="spec_aux_hidden"):
+            _cfg(
+                model_dir,
+                spec_tokens=0,
+                spec_draft="ngram",
+                spec_draft_model="",
+                spec_aux_hidden=True,
+            )
+
     def test_spec_off_by_default(self, model_dir):
         cfg = EngineConfig(model=model_dir, device_ids=[0], max_num_seqs=1)
         assert cfg.spec_tokens == 0

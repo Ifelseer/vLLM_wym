@@ -102,6 +102,10 @@ class EngineConfig:
     spec_target_layer_ids: tuple[int, ...] = (1, 9, 17, 25, 33)
     # DSpark 草稿 checkpoint 目录（spec_draft="dspark" 时必填）
     spec_draft_model: str = ""
+    # 强制打开 aux hidden 采集（dspark 会自动打开）。单独留一个开关是为了让
+    # "aux 是否逐位置稳定"这条不变量能在**不加载草稿模型**的情况下测（见
+    # tests/gpu/test_dspark_aux_gpu.py）。
+    spec_aux_hidden: bool = False
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
@@ -167,6 +171,8 @@ class EngineConfig:
                     raise FileNotFoundError(
                         f"draft model path not found: {self.spec_draft_model}"
                     )
+        if self.spec_aux_hidden and self.spec_tokens <= 0:
+            raise ValueError("spec_aux_hidden requires spec_tokens > 0")
         if self.spec_tie_eps < 0:
             raise ValueError(f"spec_tie_eps must be >= 0, got {self.spec_tie_eps}")
         if self.spec_tie_eps > 0 or self.spec_exact_kv:
