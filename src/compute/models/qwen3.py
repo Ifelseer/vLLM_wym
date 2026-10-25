@@ -150,6 +150,23 @@ class Qwen3Attention(nn.Module):
         return q, k, v
 
 
+def _rope_theta(config) -> float:
+    """兼容 transformers 5.x（``rope_parameters``）与 4.5x（标量 ``rope_theta``）。
+
+    5.x 把 rope 参数收进 ``rope_parameters``（dict 或对象），4.5x 只有 ``rope_theta``
+    标量。两条路径取到的是同一个数（checkpoint 的 config.json 里本来只有
+    ``rope_theta``），数值完全等价；不做回退的话在 4.57 上直接 AttributeError。
+    """
+    rp = getattr(config, "rope_parameters", None)
+    if rp is not None:
+        theta = (
+            rp["rope_theta"] if isinstance(rp, dict) else getattr(rp, "rope_theta", None)
+        )
+        if theta is not None:
+            return float(theta)
+    return float(getattr(config, "rope_theta", 1000000.0))
+
+
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config, layer_id: int = 0, quant=None):
         super().__init__()
@@ -158,7 +175,7 @@ class Qwen3DecoderLayer(nn.Module):
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             max_position=config.max_position_embeddings,
-            rope_theta=float(config.rope_parameters["rope_theta"]),
+            rope_theta=_rope_theta(config),
             rms_norm_eps=config.rms_norm_eps,
             qkv_bias=getattr(config, "attention_bias", False),
             head_dim=getattr(config, "head_dim", None),
