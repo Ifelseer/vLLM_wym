@@ -34,6 +34,7 @@ verify 是把各序列的 ``[anchor + drafts]`` 按 ``cu_seqlens`` 拼平做一�
 from __future__ import annotations
 
 import argparse
+import gc
 import json
 import statistics
 import sys
@@ -151,6 +152,9 @@ def _run_one(
         }
     finally:
         eng.destroy()
+        # baseline 与 spec 在同一进程里串跑时，exit 137（被 OOM killer 杀）通常是
+        # **主机内存**没回收干净——两份权重先后加载会叠加。gc + empty_cache 一起做。
+        gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
