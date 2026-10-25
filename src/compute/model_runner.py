@@ -149,6 +149,10 @@ class ModelRunner:
         if config.torch_compile:
             self.prefill_fn = self._build_compiled_prefill()
 
+        # 投机：把 verify 的 M=1+k 形状预热掉（FP8 autotune / Triton 首次编译），
+        # 否则第一个请求会吃到秒级尖刺。放在所有 warmup 之后执行。
+        self._warmup_verify_shapes()
+
     def _make_pp_buffer(self, n: int) -> IntermediateTensors:
         return IntermediateTensors(
             hidden_states=torch.empty(
@@ -221,6 +225,40 @@ class ModelRunner:
             self.batch.cache_seqlens[:plan_bs],
             cg=use_cg,
         )
+
+    @torch.inference_mode()
+    def _warmup_verify_shapes(self) -> None:
+        """启动期把 verify 会用到的 ``M = 1+k`` 形状预热一遍。
+
+        为什么必须：FP8 per-block GEMM 带 ``@triton.autotune(key=["M","N","K"])``。
+        decode 预热只见过 ``M=1``、prefill 见过大 M，而 verify 的 ``M = 1+k`` 是
+        **新形状** —— 首次调用会现场 ``do_bench``（每轮清 256MB L2 + 同步），
+        落在第一个请求上就是秒级尖刺。提前跑一遍把 autotune 结果缓存好。
+
+        取证方式与 `_fake_decode_batch` 一致：假序列 + 页表指向 page 0，写入的
+        脏 KV 会在真实请求首次写该槽时被覆盖。
+        """
+        if self.config.spec_tokens <= 0 or self._pp_group.size > 1:
+            return
+        cached = 8  # 让 cu_seqlens_k > cu_seqlens_q，走"带缓存"的注意力分支
+        for m in range(2, self.config.spec_tokens + 2):
+            vseq = SeqSchedule(
+                seq_id=-1,
+                block_table=[0],
+                num_cached_tokens=cached,
+                token_ids=[1] * m,
+            )
+            self.batch.build_prefill([vseq])
+            it = self._recv_intermediate(m) if not self.is_first_pp else None
+            with attention_context(self._meta):
+                self.model(
+                    self.batch.input_ids[:m],
+                    self.batch.positions[:m],
+                    self._prefill_attn(1, m, m, cached + m, True),
+                    it,
+                    self._ensure_aux(m),
+                )
+        torch.cuda.synchronize(self.device)
 
     def _pp_dst(self) -> int:
         return self._pp_group.next_group_rank

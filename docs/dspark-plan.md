@@ -247,6 +247,23 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 > - 仍未做：`--cg` 口径的正式性能数、与 vLLM 的 acceptance length 对照
 >   （vLLM 基线那一条至今没跑）。
 
+#### 与量化组合（Phase 5 提前处理，2026-10-25）
+
+24G 卡上走 **FP8 目标 + BF16 草稿**（约 7.7G + 4.7G + KV 2.4G + 图池/激活 ≈ 19G）。
+已静态排查的两处交互：
+
+1. **FP8 kernel 的 autotune 会落在第一个请求上** ✅ 已修。FP8 per-block GEMM 带
+   `@triton.autotune(key=["M","N","K"])`，decode 只预热过 `M=1`、prefill 是大 M，
+   而 verify 的 `M=1+k` 是新形状 → 首次现场 `do_bench`（清 L2 + 同步）＝秒级尖刺。
+   新增 `ModelRunner._warmup_verify_shapes()`，在 `__init__` 末尾对 `m=2..k+1`
+   各跑一次假 verify（页表指向 page 0，脏 KV 会被真实请求覆盖）。
+2. **prefill 的 torch.compile 在量化下本就关闭**（`_build_compiled_prefill` 对
+   `quant_config` 非 None 直接返回 None），而 verify 走的就是即时前向，不冲突。
+3. **FP8 KV cache 是可选项**：`_run_verify` 里已有 `plan_prefill`；若要再省一半 KV
+   显存可开 `quant_kv_cache`，但它与 spec 的组合**未实测**，建议先不开。
+
+INT8 的坑（`M=16` 双路径切换正好被 `1+k` 的形状踩到）本轮不涉及——走 FP8 就绕开了。
+
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 
 **验收**：acceptance length ≥ vLLM/DeepSpec 基线的 90%；Qwen3-8B/4090/batch=1/256-prompt decode ≥1.4×；greedy 逐位一致。

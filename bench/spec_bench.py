@@ -63,6 +63,7 @@ def _run_one(
     tie_eps: float = 0.0,
     exact_kv: bool = False,
     draft_model: str = "",
+    num_blocks: int = 64,
 ) -> dict:
     import torch
 
@@ -75,7 +76,7 @@ def _run_one(
             enforce_eager=not cg,
             max_num_seqs=1,
             context_len=2048,
-            num_kvcache_blocks=64,
+            num_kvcache_blocks=num_blocks,
             gpu_memory_utilization=0.85,
             prefix_backend="none",
             spec_tokens=spec_tokens,
@@ -158,6 +159,12 @@ def main() -> None:
     )
     p.add_argument("--temperature", type=float, default=0.0)
     p.add_argument("--n", type=int, default=64)
+    p.add_argument(
+        "--num-kvcache-blocks",
+        type=int,
+        default=64,
+        help="KV 块数。FP8 目标 + BF16 草稿约 19G，24G 卡保持 64；放不下就调小",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--devices", default="0")
@@ -200,6 +207,7 @@ def main() -> None:
         tie_eps=args.spec_tie_eps,
         exact_kv=args.spec_exact_kv,
         draft_model=args.spec_draft_model,
+        num_blocks=args.num_kvcache_blocks,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
     # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
