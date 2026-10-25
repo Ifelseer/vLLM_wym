@@ -114,8 +114,8 @@ class EngineConfig:
     # 1. `max_seqlen_k` 是 kernel 的标量参数，录图后不可变 → 用
     #    `spec_verify_graph_max_k` 做上界桶，超出该长度的序列回退 eager
     #    （桶越小越省，但覆盖的上下文越短）；
-    # 2. 与 `spec_exact_kv` 互斥：后者要在 verify 之后逐位置重跑 decode，
-    #    那段本来就是 eager，图只覆盖 verify 本身。
+    # 2. 与 `spec_exact_kv` 正交可叠加：图只覆盖 verify，exact 的逐位置重跑
+    #    本来就在图外。
     spec_verify_graph: bool = False
     spec_verify_graph_max_k: int = 256
 
