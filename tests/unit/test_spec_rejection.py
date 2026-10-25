@@ -113,6 +113,60 @@ class TestFinalProbs:
         want = self.sampler.final_probs(self.logits, self.temps)[0].double()
         assert torch.all((got - want).abs() < _TOL), f"got={got.tolist()} want={want.tolist()}"
 
+    def _mc_compare(self, *, trials: int, tol: float, **kw) -> None:
+        gen = torch.Generator().manual_seed(7)
+        logits = torch.tensor([[2.2, 1.4, 1.1, 0.3, -0.5, -2.0]])
+        temps = torch.tensor([1.0])
+        vocab = logits.shape[1]
+        out = torch.empty(trials, dtype=torch.long)
+        for i in range(trials):
+            out[i] = self.sampler(
+                logits, temps, generator=gen, all_greedy=False, any_greedy=False, **kw
+            )[0]
+        got = _freq(out.tolist(), vocab)
+        want = self.sampler.final_probs(logits, temps, **kw)[0].double()
+        assert torch.all((got - want).abs() < tol), (
+            f"forward 与 final_probs 不一致\n got={got.tolist()}\nwant={want.tolist()}"
+        )
+
+    def test_matches_forward_with_top_k(self):
+        """top-k 截断后 forward 的频次仍要等于 final_probs（错位高发区）。"""
+        self._mc_compare(
+            trials=8000,
+            tol=0.03,
+            top_ks=torch.tensor([3]),
+            use_top_k=True,
+            max_top_k=3,
+        )
+
+    def test_matches_forward_with_top_p(self):
+        self._mc_compare(
+            trials=8000,
+            tol=0.03,
+            top_ps=torch.tensor([0.75]),
+            use_top_p=True,
+        )
+
+    def test_matches_forward_with_top_k_and_top_p(self):
+        """两者同时开启：final_probs 的掩码必须与 forward 的"先 k 后 p"等价。"""
+        self._mc_compare(
+            trials=8000,
+            tol=0.03,
+            top_ks=torch.tensor([4]),
+            top_ps=torch.tensor([0.85]),
+            use_top_k=True,
+            use_top_p=True,
+            max_top_k=4,
+        )
+
+    def test_matches_forward_with_min_p(self):
+        self._mc_compare(
+            trials=8000,
+            tol=0.03,
+            min_ps=torch.tensor([0.3]),
+            use_min_p=True,
+        )
+
 
 # ---------------------------------------------------------------- #
 # 2. accept_rejection：输出分布必须等于目标分布
