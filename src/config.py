@@ -106,6 +106,18 @@ class EngineConfig:
     # "aux 是否逐位置稳定"这条不变量能在**不加载草稿模型**的情况下测（见
     # tests/gpu/test_dspark_aux_gpu.py）。
     spec_aux_hidden: bool = False
+    # verify 的 CUDA Graph 分档（默认关）。verify 走 eager 时每步几十次 kernel
+    # launch，是投机在大模型上"接受了草稿但吞吐不涨"的主因。开启后按
+    # m = 2..k+1 各录一张图。
+    #
+    # 两个必须知道的约束：
+    # 1. `max_seqlen_k` 是 kernel 的标量参数，录图后不可变 → 用
+    #    `spec_verify_graph_max_k` 做上界桶，超出该长度的序列回退 eager
+    #    （桶越小越省，但覆盖的上下文越短）；
+    # 2. 与 `spec_exact_kv` 互斥：后者要在 verify 之后逐位置重跑 decode，
+    #    那段本来就是 eager，图只覆盖 verify 本身。
+    spec_verify_graph: bool = False
+    spec_verify_graph_max_k: int = 256
 
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
@@ -173,6 +185,13 @@ class EngineConfig:
                     )
         if self.spec_aux_hidden and self.spec_tokens <= 0:
             raise ValueError("spec_aux_hidden requires spec_tokens > 0")
+        if self.spec_verify_graph:
+            if self.spec_tokens <= 0:
+                raise ValueError("spec_verify_graph requires spec_tokens > 0")
+            if self.pp_size > 1:
+                raise ValueError("spec_verify_graph requires pp_size == 1")
+            if self.spec_verify_graph_max_k <= 0:
+                raise ValueError("spec_verify_graph_max_k must be > 0")
         if self.spec_tie_eps < 0:
             raise ValueError(f"spec_tie_eps must be >= 0, got {self.spec_tie_eps}")
         if self.spec_tie_eps > 0 or self.spec_exact_kv:

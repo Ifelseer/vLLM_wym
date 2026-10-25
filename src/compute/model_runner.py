@@ -63,6 +63,9 @@ class ModelRunner:
         self._dspark = None
         self._dspark_pending: dict[int, torch.Tensor] = {}
         self._draft_probs: torch.Tensor | None = None
+        # verify 的 CUDA Graph 分档（m -> graph）与静态输出缓冲
+        self._verify_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._verify_out: torch.Tensor | None = None
         self._meta = AttnMetadata(kv_cache=self.kv_cache)
 
         pp = get_pp_group()
@@ -152,6 +155,8 @@ class ModelRunner:
         # 投机：把 verify 的 M=1+k 形状预热掉（FP8 autotune / Triton 首次编译），
         # 否则第一个请求会吃到秒级尖刺。放在所有 warmup 之后执行。
         self._warmup_verify_shapes()
+        # 可选：把 verify 本身也录图（默认关；失败自动回退 eager）
+        self._capture_verify_graphs()
 
     def _make_pp_buffer(self, n: int) -> IntermediateTensors:
         return IntermediateTensors(
@@ -259,6 +264,67 @@ class ModelRunner:
                     self._ensure_aux(m),
                 )
         torch.cuda.synchronize(self.device)
+
+    def _fake_verify_batch(self, m: int, cached: int = 8) -> None:
+        """构造一行假 verify 批（m 个 token、页表指向 page 0）。"""
+        vseq = SeqSchedule(
+            seq_id=-1,
+            block_table=[0],
+            num_cached_tokens=cached,
+            token_ids=[1] * m,
+        )
+        self.batch.build_prefill([vseq])
+
+    def _verify_body(self, m: int, max_k: int):
+        """verify 的可录图部分：只含模型前向，输出拷进静态缓冲。"""
+        with attention_context(self._meta):
+            out = self.model(
+                self.batch.input_ids[:m],
+                self.batch.positions[:m],
+                self._prefill_attn(1, m, m, max_k, True),
+                None,
+                self._ensure_aux(m),
+            )
+        self._verify_out[:m].copy_(out)
+        return out
+
+    def _capture_verify_graphs(self) -> None:
+        """按 m = 2..k+1 各录一张 verify 图（失败则整体回退 eager）。
+
+        `max_seqlen_k` 是 attention kernel 的标量参数（进图后不可变），所以用
+        `spec_verify_graph_max_k` 当上界桶：实际 `p+m <= 桶` 才用图，否则回退。
+        桶内浪费的只是 tile 粒度（空块早退），不是正确性问题。
+        """
+        if not self.config.spec_verify_graph or self.config.spec_tokens <= 0:
+            return
+        if self._pp_group.size > 1:
+            print("[WARN] spec_verify_graph 需要 pp_size == 1，已回退 eager verify")
+            return
+        max_k = int(self.config.spec_verify_graph_max_k)
+        graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        try:
+            self._verify_out = torch.empty(
+                self.config.max_num_batched_tokens,
+                self.hidden_size,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            for m in range(2, self.config.spec_tokens + 2):
+                self._fake_verify_batch(m)
+                self._verify_body(m, max_k)  # 图外 warmup：算子初始化 / autotune
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g):
+                    self._verify_body(m, max_k)
+                graphs[m] = g
+            torch.cuda.synchronize(self.device)
+        except Exception as exc:  # noqa: BLE001 - 录图失败要能整体降级
+            print(
+                f"[WARN] spec_verify_graph 录图失败（{type(exc).__name__}: {exc}），"
+                "已回退 eager verify"
+            )
+            self._verify_out = None
+            graphs.clear()
+        self._verify_graphs = graphs
 
     def _pp_dst(self) -> int:
         return self._pp_group.next_group_rank
@@ -487,15 +553,24 @@ class ModelRunner:
                 self.batch.cu_seqlens_k[:2],
                 self.batch.block_tables[:1],
             )
-        it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
-        with attention_context(self._meta):
-            hidden = self.model(
-                self.batch.input_ids[:n_tokens],
-                self.batch.positions[:n_tokens],
-                self._prefill_attn(1, n_tokens, max_q, max_k, has_cache),
-                it,
-                self._ensure_aux(n_tokens),
-            )
+        graph = self._verify_graphs.get(m)
+        if graph is not None and (
+            s.num_cached_tokens + m <= self.config.spec_verify_graph_max_k
+        ):
+            # 录图口径：build_prefill 已把 input_ids/positions/slot_mapping/
+            # cu_seqlens 写进静态 GPU 缓冲，replay 只跑模型前向
+            graph.replay()
+            hidden = self._verify_out[:m]
+        else:
+            it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
+            with attention_context(self._meta):
+                hidden = self.model(
+                    self.batch.input_ids[:n_tokens],
+                    self.batch.positions[:n_tokens],
+                    self._prefill_attn(1, n_tokens, max_q, max_k, has_cache),
+                    it,
+                    self._ensure_aux(n_tokens),
+                )
         if not self.is_last_pp:
             self._send_intermediate(hidden)
             return None

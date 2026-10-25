@@ -64,6 +64,7 @@ def _run_one(
     exact_kv: bool = False,
     draft_model: str = "",
     num_blocks: int = 64,
+    verify_graph: bool = False,
 ) -> dict:
     import torch
 
@@ -84,6 +85,7 @@ def _run_one(
             spec_tie_eps=tie_eps,
             spec_exact_kv=exact_kv,
             spec_draft_model=draft_model,
+            spec_verify_graph=verify_graph,
         )
     )
     try:
@@ -172,6 +174,11 @@ def main() -> None:
     p.add_argument("--quantization", default="none", choices=_QUANT_CHOICES)
     p.add_argument("--cg", action="store_true", help="启用 decode CUDA Graph")
     p.add_argument(
+        "--spec-verify-graph",
+        action="store_true",
+        help="把 verify 也录进 CUDA Graph（按 m=2..k+1 分档；录图失败自动回退）",
+    )
+    p.add_argument(
         "--spec-tie-eps",
         type=float,
         default=0.0,
@@ -208,6 +215,7 @@ def main() -> None:
         exact_kv=args.spec_exact_kv,
         draft_model=args.spec_draft_model,
         num_blocks=args.num_kvcache_blocks,
+        verify_graph=args.spec_verify_graph,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
     # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
