@@ -220,7 +220,10 @@ def main() -> None:
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
     # baseline 不需要守卫：spec_tokens=0 时它们无意义，显式置 0 以免 config 校验误判
     base = _run_one(
-        args.model, prompt, spec_tokens=0, **{**common, "tie_eps": 0.0, "exact_kv": False}
+        args.model,
+        prompt,
+        spec_tokens=0,
+        **{**common, "tie_eps": 0.0, "exact_kv": False, "verify_graph": False},
     )
     print(
         f"[run] spec k={args.spec_tokens} draft={args.spec_draft} "
@@ -228,7 +231,9 @@ def main() -> None:
     )
     spec = _run_one(args.model, prompt, spec_tokens=args.spec_tokens, **common)
 
-    speedup = base["decode_tok_s"] / spec["decode_tok_s"]
+    # 口径：spec 相对 baseline 的倍数（>1 才是加速）。写成 base/spec 会把 3.4×
+    # 印成 0.29×，直接反过来误判"投机没有收益"。
+    speedup = spec["decode_tok_s"] / base["decode_tok_s"]
     match = _consistency(base["tokens"], spec["tokens"])
 
     rows = [

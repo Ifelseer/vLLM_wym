@@ -288,12 +288,18 @@ class ModelRunner:
         self._verify_out[:m].copy_(out)
         return out
 
+    @torch.inference_mode()
     def _capture_verify_graphs(self) -> None:
         """按 m = 2..k+1 各录一张 verify 图（失败则整体回退 eager）。
 
         `max_seqlen_k` 是 attention kernel 的标量参数（进图后不可变），所以用
         `spec_verify_graph_max_k` 当上界桶：实际 `p+m <= 桶` 才用图，否则回退。
         桶内浪费的只是 tile 粒度（空块早退），不是正确性问题。
+
+        ⚠️ 必须整体跑在 ``inference_mode`` 里：aux 采集用的是
+        ``torch.add(h, residual, out=...)``，而 ``out=`` 不支持自动微分——录图时
+        h/residual 仍带 grad（``__init__`` 不在 inference_mode 内），会直接抛
+        "functions with out=... don't support automatic differentiation"。
         """
         if not self.config.spec_verify_graph or self.config.spec_tokens <= 0:
             return

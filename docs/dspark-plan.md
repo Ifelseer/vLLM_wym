@@ -264,6 +264,31 @@ verify 走 eager（不进 decode 图）多了一次前向的 launch 开销 → �
 
 INT8 的坑（`M=16` 双路径切换正好被 `1+k` 的形状踩到）本轮不涉及——走 FP8 就绕开了。
 
+#### verify CUDA Graph 的 A/B 实测（2026-10-25，4090 24G，FP8 目标 + BF16 草稿）
+
+| 指标 | A: eager verify | B: verify graph |
+|---|---|---|
+| baseline decode tok/s | 93.8 | 93.8 |
+| spec decode tok/s | 134.9 | **318.7** |
+| decode 加速比（spec/base） | 1.438x | **3.398x** |
+| e2e tok/s | 127.2 | 272.8 |
+| accept_rate / accept_len | 65.64% / 5.595 | 65.64% / 5.595 |
+| greedy 一致率 | 100% | 100% |
+| peak | 16.49 GB | 16.55 GB |
+| proposed / steps | 259 / 37 = 7.0 | 259 / 37 = 7.0 |
+
+B 相对 A：decode 2.36x、e2e 2.15x，而接受率与一致率逐位不变——图里的静态缓冲
+没有残留。A/B 的设计目的就是让"收益"与"正确性"同时被验证。
+
+**录图失败的真正原因**：报错为 `add(): functions with out=... don't support
+automatic differentiation`，来自 aux 采集的 `torch.add(h, residual, out=...)`。
+`_capture_verify_graphs` 在 `__init__` 里调用、不在 `inference_mode` 内，h/residual
+仍带 grad，`out=` 与 autograd 冲突。把 capture 整体包进 `torch.inference_mode()`
+即可——**不是 varlen 注意力不可捕获**。
+
+**bench 口径修正**：原 `speedup = base/spec` 把 3.4x 印成 0.29x，已改为 `spec/base`；
+baseline 那一路显式置 `verify_graph=False`（`spec_tokens=0` 时 config 会拒绝）。
+
 改动：目标模型输出 aux hidden（`target_layer_ids` 的 5 层，`hidden_states[layer_id+1]` 口径）；vendor/加载 `Qwen3DSparkModel`；实现 `DSparkDrafter.propose()`（7 个 mask token + anchor → 块前向 → markov → confidence 截断）。
 
 **验收**：acceptance length ≥ vLLM/DeepSpec 基线的 90%；Qwen3-8B/4090/batch=1/256-prompt decode ≥1.4×；greedy 逐位一致。

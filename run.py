@@ -72,6 +72,8 @@ DEFAULTS = {
     "spec_draft": "ngram",
     "spec_tie_eps": 0.0,
     "spec_draft_model": "",
+    "spec_verify_graph": False,
+    "spec_verify_graph_max_k": 256,
 }
 
 
@@ -111,6 +113,8 @@ def _make_engine(cfg: dict) -> Engine:
             spec_draft=cfg.get("spec_draft", "ngram"),
             spec_tie_eps=float(cfg.get("spec_tie_eps", 0.0)),
             spec_draft_model=cfg.get("spec_draft_model", ""),
+            spec_verify_graph=bool(cfg.get("spec_verify_graph", False)),
+            spec_verify_graph_max_k=int(cfg.get("spec_verify_graph_max_k", 256)),
         )
     )
 
@@ -295,6 +299,18 @@ def main() -> None:
         help="DSpark 草稿 checkpoint 目录（spec-draft=dspark 时必填）",
     )
     p.add_argument(
+        "--spec-verify-graph",
+        action="store_true",
+        help="把 verify 也录进 CUDA Graph（按 m=2..k+1 分档；实测 decode 2.36x）",
+    )
+    p.add_argument(
+        "--spec-verify-graph-max-k",
+        type=int,
+        default=None,
+        help="verify 图能覆盖的最大 KV 长度（max_seqlen_k 进图后不可变，按此分桶；"
+        "超出则回退 eager）",
+    )
+    p.add_argument(
         "--pp-layer-counts",
         type=str,
         default=None,
@@ -361,6 +377,10 @@ def main() -> None:
         cfg["spec_tie_eps"] = args.spec_tie_eps
     if args.spec_draft_model is not None:
         cfg["spec_draft_model"] = args.spec_draft_model
+    if args.spec_verify_graph:
+        cfg["spec_verify_graph"] = True
+    if args.spec_verify_graph_max_k is not None:
+        cfg["spec_verify_graph_max_k"] = args.spec_verify_graph_max_k
 
     if args.batch:
         run_batch(cfg)
