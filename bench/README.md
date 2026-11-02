@@ -68,6 +68,21 @@ PYTHONPATH=. python bench/vs_vllm.py --model ~/huggingface/Qwen3-0.6B-FP8 \
 预量化 checkpoint 的注册表与有效显存估算见
 `python run.py --list`（`QUANT_REGISTRY`，来源核验日 2026-10-12）。
 
+## ZOS（调度与计算重叠）
+
+```bash
+# 同进程对照：只切 enable_zos，其余全同
+PYTHONPATH=. python bench/zos_bench.py --model ~/huggingface/Qwen3-0.6B --cg --n 128
+
+# 拆进程（推荐，避免两份权重叠加导致 exit 137）
+PYTHONPATH=. python bench/zos_bench.py --model ... --cg --run sync --json zos_sync.json
+PYTHONPATH=. python bench/zos_bench.py --model ... --cg --run zos  --json zos_on.json
+```
+
+看三件事：`decode_step_ms_p50`（ZOS 的直接收益）、`decode_tok_s`（结果）、
+`greedy 逐 token 一致`（硬 gate）。**`lookahead_submitted=0` 时这组对照无效**——
+说明每拍都被 drain，流水线从没真正提前提交。
+
 ## 投机解码（spec）
 
 ```bash
