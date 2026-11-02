@@ -244,6 +244,7 @@ class DSparkDrafter:
         anchors: torch.Tensor,
         starts: torch.Tensor,
         ctxs: list[torch.Tensor],
+        segs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """批量化起草的**设备侧入参**版本（ZOS 用）。
 
@@ -260,8 +261,14 @@ class DSparkDrafter:
         """
         b = len(seq_ids)
         assert anchors.numel() == b and starts.numel() == b
-        segs = [int(c.shape[-2]) if c.dim() == 3 else int(c.shape[0]) for c in ctxs]
-        seg_max = max(segs) if segs else 0
+        if segs is not None:
+            # ZOS：ctxs 已经是 pad 到 m 的整块，真实长度由设备 seg 给出
+            device_segs, seg_list = segs, None
+            seg_max = int(ctxs[0].shape[-2])
+        else:
+            device_segs = None
+            seg_list = [int(c.shape[-2]) if c.dim() == 3 else int(c.shape[0]) for c in ctxs]
+            seg_max = max(seg_list) if seg_list else 0
         block = self.block_size
         dtype = next(self.model.parameters()).dtype
         feat = int(ctxs[0].shape[-1])
@@ -271,7 +278,8 @@ class DSparkDrafter:
         ctx_pad = torch.zeros(b, seg_max, feat, dtype=dtype, device=self.device)
         for i, c in enumerate(ctxs):
             c3 = c if c.dim() == 3 else c.unsqueeze(0)
-            ctx_pad[i, : segs[i]] = c3[0].to(dtype)
+            take = seg_max if seg_list is None else seg_list[i]
+            ctx_pad[i, :take] = c3[0][:take].to(dtype)
 
         ids = torch.full(
             (b, block), self.mask_token_id, dtype=torch.long, device=self.device
@@ -281,14 +289,21 @@ class DSparkDrafter:
         # 位置必须按**真实 token** 排：ctx 段 [start-seg, start) + 块 [start, start+block)。
         # 用 padded 的 kv 偏移算会让短行的块位置整体后移 seg_max-seg。
         start_col = starts.to(torch.long).view(b, 1)
-        seg_col = torch.tensor(segs, dtype=torch.long, device=self.device).view(b, 1)
+        if device_segs is None:
+            seg_col = torch.tensor(
+                seg_list, dtype=torch.long, device=self.device
+            ).view(b, 1)
+        else:
+            seg_col = device_segs.to(torch.long).view(b, 1)
         ctx_pos = (start_col - seg_col) + torch.arange(
             seg_max, device=self.device
         ).view(1, -1)
         blk_pos = start_col + torch.arange(block, device=self.device).view(1, -1)
         pos_rows = torch.cat([ctx_pos, blk_pos], dim=1)
 
-        cache.begin_step(rows, segs, seg_max, block)
+        cache.begin_step(
+            rows, seg_list, seg_max, block, device_segs=device_segs
+        )
         mask = cache.mask(q_len=block, dtype=dtype)
         hidden = self.model._forward_backbone(
             position_ids=pos_rows,
@@ -313,6 +328,37 @@ class DSparkDrafter:
         if self.temperature > 1e-5:
             probs = torch.softmax(corrected.float() / self.temperature, dim=-1)
         return tokens, probs
+
+    def update_full(
+        self,
+        seq_id: int,
+        ctx_block: torch.Tensor,
+        seg: torch.Tensor,
+        start: int = -1,
+    ) -> None:
+        """ZOS：存**整块** ctx（`[1, m, F]`）与设备侧 seg（`1+j`），不做切片。
+
+        普通路径的 `update` 用 host 的 `accepted` 切片（`aux[:accepted+1]`），ZOS 下
+        这个值只在设备上，所以改成"存满 + 传设备 seg"，由 `propose_batch_ids` 用
+        `device_segs` 把多余位置 mask 掉。
+        """
+        st = self._state.get(seq_id)
+        if st is None:
+            st = _DraftState(past=DynamicCache(), pending_ctx=None, start=0)
+            self._state[seq_id] = st
+        st.pending_ctx = ctx_block
+        st.pending_seg = seg
+        if start >= 0:
+            st.start = start
+
+    def take_pending(self, seq_id: int) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """取走该序列待用的 (ctx 块, 设备 seg)，并清空。"""
+        st = self._state.get(seq_id)
+        if st is None:
+            return None, None
+        ctx, seg = st.pending_ctx, st.pending_seg
+        st.pending_ctx, st.pending_seg = None, None
+        return ctx, seg
 
     def reset_seq(self, seq_id: int) -> None:
         """释放一条序列的草稿状态与 KV 行。"""
