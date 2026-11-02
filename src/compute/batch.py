@@ -135,6 +135,30 @@ class Batch:
             self.cache_seqlens[bs:pad_to].zero_()
             self.block_tables[bs:pad_to].fill_(-1)
 
+    def bind_verify(self, bs: int, m: int) -> int:
+        """绑定 verify 用的 prefill 视图，但**不填内容**（ZOS 下由设备侧写）。
+
+        与 `build_prefill` 的区别：不构造 positions/slot_mapping/cu_seqlens_k，也不做
+        任何 H2D。只做两件事——把视图指向 `_inputs`，并把 `cu_seqlens_q` 写成常量
+        `[0, m, 2m, ...]`（每行 m 个 token，dspark 下恒等）。
+
+        Returns:
+            每行的 token 数 `m` 与本批总 token 数 `bs * m` 中的后者（供调用方切缓冲）。
+        """
+        n = bs * m
+        (
+            self.input_ids,
+            self.positions,
+            self.slot_mapping,
+            self.cu_seqlens_q,
+            self.cu_seqlens_k,
+            self.block_tables,
+        ) = self._input_views(self._inputs, n, bs)
+        self.cu_seqlens_q[: bs + 1].copy_(
+            torch.arange(0, (bs + 1) * m, m, dtype=torch.int32, device=self.device)
+        )
+        return n
+
     def build_prefill(self, seqs: list[SeqSchedule]) -> tuple[int, int, int, bool]:
         ids = self._pre_ids_np
         positions = self._pre_pos_np
