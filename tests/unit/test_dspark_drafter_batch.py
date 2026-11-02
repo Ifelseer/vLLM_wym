@@ -109,6 +109,36 @@ class TestBatchEquivalence:
         assert out[0][0] == single_toks[0]
         assert out[1][0] == single_toks[1]
 
+    def test_tensor_entry_matches_int_entry(self, model):
+        """ZOS 用张量入参的入口，必须与 int 入参版本逐位相同。
+
+        ZOS 下 anchor/start 都是设备张量（CPU 不知道值），位置编码只能用 broadcast
+        现算；一旦两版的位置/掩码有差，草稿 token 就会分叉——而 accept_len 掉一点
+        几乎看不出来，所以这里逐位比对。
+        """
+        seg_a, seg_b = 5, 4
+        ctx_a, ctx_b = _ctx(seg_a), _ctx(seg_b)
+        anchor_a, anchor_b = 11, 22
+
+        d_int = DSparkDrafter(model, device=torch.device("cpu"))
+        want_a, _ = d_int.propose(
+            1, anchor_token_id=anchor_a, start=seg_a, first_ctx=ctx_a
+        )
+        want_b, _ = d_int.propose(
+            2, anchor_token_id=anchor_b, start=seg_b, first_ctx=ctx_b
+        )
+
+        d_t = DSparkDrafter(model, device=torch.device("cpu"), max_rows=4)
+        toks, _ = d_t.propose_batch_ids(
+            [1, 2],
+            torch.tensor([anchor_a, anchor_b], dtype=torch.long),
+            torch.tensor([seg_a, seg_b], dtype=torch.long),
+            [ctx_a, ctx_b],
+        )
+        assert toks.shape[0] == 2
+        assert toks[0].tolist() == want_a, f"seq0 tensor={toks[0].tolist()} int={want_a}"
+        assert toks[1].tolist() == want_b, f"seq1 tensor={toks[1].tolist()} int={want_b}"
+
     def test_falls_back_when_only_one_participant(self, model):
         """只有一个参与者时走单序列路径（结果仍要正确）。"""
         ctx = _ctx(5)

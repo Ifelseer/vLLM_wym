@@ -237,6 +237,83 @@ class DSparkDrafter:
             )
         return self._padded
 
+    @torch.inference_mode()
+    def propose_batch_ids(
+        self,
+        seq_ids: list[int],
+        anchors: torch.Tensor,
+        starts: torch.Tensor,
+        ctxs: list[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """批量化起草的**设备侧入参**版本（ZOS 用）。
+
+        与 ``propose_batch`` 的区别只有入参来源：``anchors`` / ``starts`` 是 ``[B]``
+        的设备张量（上一拍的采样结果与推进后的起始位置），CPU 并不知道它们的值。
+        位置编码因此必须用 broadcast 现算，不能再用 Python int。
+
+        为什么不做行长度对齐（``seed_row``）：ZOS 下每拍都走 ``crop``，每行的有效长度
+        是**增量维护**的；只有序列首次进入流水线时才需要 seed，而那一拍是同步提交的
+        （CPU 状态准确），走 ``propose_batch`` 的 int 路径即可。
+
+        Returns:
+            ``(tokens [B, block] int64, probs [B, block, vocab] | None)``
+        """
+        b = len(seq_ids)
+        assert anchors.numel() == b and starts.numel() == b
+        segs = [int(c.shape[-2]) if c.dim() == 3 else int(c.shape[0]) for c in ctxs]
+        seg_max = max(segs) if segs else 0
+        block = self.block_size
+        dtype = next(self.model.parameters()).dtype
+        feat = int(ctxs[0].shape[-1])
+        cache = self._ensure_padded()
+        rows = [self._row(sid) for sid in seq_ids]
+
+        ctx_pad = torch.zeros(b, seg_max, feat, dtype=dtype, device=self.device)
+        for i, c in enumerate(ctxs):
+            c3 = c if c.dim() == 3 else c.unsqueeze(0)
+            ctx_pad[i, : segs[i]] = c3[0].to(dtype)
+
+        ids = torch.full(
+            (b, block), self.mask_token_id, dtype=torch.long, device=self.device
+        )
+        ids[:, 0] = anchors.to(torch.long)
+
+        # 位置必须按**真实 token** 排：ctx 段 [start-seg, start) + 块 [start, start+block)。
+        # 用 padded 的 kv 偏移算会让短行的块位置整体后移 seg_max-seg。
+        start_col = starts.to(torch.long).view(b, 1)
+        seg_col = torch.tensor(segs, dtype=torch.long, device=self.device).view(b, 1)
+        ctx_pos = (start_col - seg_col) + torch.arange(
+            seg_max, device=self.device
+        ).view(1, -1)
+        blk_pos = start_col + torch.arange(block, device=self.device).view(1, -1)
+        pos_rows = torch.cat([ctx_pos, blk_pos], dim=1)
+
+        cache.begin_step(rows, segs, seg_max, block)
+        mask = cache.mask(q_len=block, dtype=dtype)
+        hidden = self.model._forward_backbone(
+            position_ids=pos_rows,
+            noise_embedding=self.model.embed_tokens(ids),
+            target_hidden_states=ctx_pad,
+            attention_mask=mask,
+            past_key_values=cache,
+            use_cache=True,
+            is_causal=False,
+        )
+        cache.crop()
+
+        block_hidden = hidden[:, :block, :]
+        base_logits = self.model.compute_logits(block_hidden)
+        tokens, corrected = self.model.sample_draft_tokens(
+            base_logits,
+            first_prev_token_ids=anchors.to(torch.long),
+            temperature=self.temperature,
+            hidden_states=block_hidden,
+        )
+        probs = None
+        if self.temperature > 1e-5:
+            probs = torch.softmax(corrected.float() / self.temperature, dim=-1)
+        return tokens, probs
+
     def reset_seq(self, seq_id: int) -> None:
         """释放一条序列的草稿状态与 KV 行。"""
         self.reset(seq_id)
