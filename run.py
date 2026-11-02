@@ -74,6 +74,8 @@ DEFAULTS = {
     "spec_draft_model": "",
     "spec_verify_graph": False,
     "spec_verify_graph_max_k": 256,
+    "enable_zos": True,
+    "zos_spec": False,
 }
 
 
@@ -115,6 +117,8 @@ def _make_engine(cfg: dict) -> Engine:
             spec_draft_model=cfg.get("spec_draft_model", ""),
             spec_verify_graph=bool(cfg.get("spec_verify_graph", False)),
             spec_verify_graph_max_k=int(cfg.get("spec_verify_graph_max_k", 256)),
+        enable_zos=bool(cfg.get("enable_zos", True)),
+        zos_spec=bool(cfg.get("zos_spec", False)),
         )
     )
 
@@ -299,6 +303,16 @@ def main() -> None:
         help="DSpark 草稿 checkpoint 目录（spec-draft=dspark 时必填）",
     )
     p.add_argument(
+        "--no-zos",
+        action="store_true",
+        help="关闭 ZOS（调度与计算重叠）；默认开启，仅在单进程下生效",
+    )
+    p.add_argument(
+        "--zos-spec",
+        action="store_true",
+        help="投机也进 ZOS 流水线（方案 B）。实测 8B 上 0.948x，默认关",
+    )
+    p.add_argument(
         "--spec-verify-graph",
         action="store_true",
         help="把 verify 也录进 CUDA Graph（按 m=2..k+1 分档；实测 decode 2.36x）",
@@ -377,6 +391,10 @@ def main() -> None:
         cfg["spec_tie_eps"] = args.spec_tie_eps
     if args.spec_draft_model is not None:
         cfg["spec_draft_model"] = args.spec_draft_model
+    if args.no_zos:
+        cfg["enable_zos"] = False
+    if args.zos_spec:
+        cfg["zos_spec"] = True
     if args.spec_verify_graph:
         cfg["spec_verify_graph"] = True
     if args.spec_verify_graph_max_k is not None:

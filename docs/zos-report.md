@@ -214,3 +214,40 @@ def step(self):
 3. **默认开要有可观测性兜底**。ZOS 默认开（照 DeepInfer），但同时提供
    `--no-zos`、`enable_zos=False` 与完整的 counters——出问题能一行关掉、也能从计数
    看出是"没生效"还是"生效了但收益小"。
+
+---
+
+## 9. 投机 + ZOS 的实测结论：**正确，但当前无收益**
+
+投机进 ZOS 走的是方案 B（草稿按 `m` 追加 + 设备侧有效位 + `ub` 上界选桶），实现分
+四块：`advance_verify`（verify 元数据设备侧）、`accept_greedy_device`（整批裁决）、
+`propose_batch_ids`（草稿设备侧入参）、`_verify_zos`（接线）。8B FP8 + dspark k=7：
+
+| 配置 | decode tok/s | 相对 |
+|---|---|---|
+| spec（非 ZOS） | 332.6 | 1.000× |
+| spec + ZOS，**eager verify** | 148.5 | 0.446× |
+| spec + ZOS，**ub + verify 图** | **315.4** | **0.948×** |
+
+- 正确性：`accept_len 6.000`、`accept_rate 71.43%`、`proposed/accepted/steps 469/335/67`、
+  逐位置曲线、128 个 token，与非 ZOS **逐位一致**；
+- 从 eager 版到图版提升 **2.12×**，全部来自"把 verify 图拿回来"。
+
+### 结论：投机路径的 host 工作已经不足以撑起 ZOS
+
+```
+普通 decode：C 里有 build_decode(5 字段 + H2D) + 回读 + postprocess  → 藏掉 C 得到 4.7%
+投机：      C 已被设备侧裁决 + 图压得很小，而 ZOS 还额外增加了
+            「设备侧元数据构造 + ub 判断」的开销            → 净收益 -5%
+```
+
+所以 **`zos_spec` 默认关**，这条路径记为"已验证正确、当前实现下无收益"。要让它转正，
+前提是先有东西**增大 C**（例如调度逻辑变重），而不是继续优化它的开销。
+
+### 三个只影响性能、不影响正确性的遗留
+
+| 项 | 说明 |
+|---|---|
+| `ub` 周期重锚 | 已实现（每 32 拍 drain 一次）；不做的话长生成会一路退回 eager |
+| `--zos-spec` CLI | 已实现（`--no-zos` / `--zos-spec`） |
+| 草稿 KV 改 paged（方案 A） | 能彻底去掉 host 形状依赖 + padding 浪费，但与 ZOS 解耦，属独立重构项 |
