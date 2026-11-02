@@ -83,6 +83,9 @@ class ModelRunner:
         self._zos_adv: torch.Tensor | None = None
         # ZOS+投机：每行的"下一拍起始位置"（设备侧精确值）
         self._zos_start: torch.Tensor | None = None
+        #: ZOS+投机：每行起始位置的**host 上界**（用于选 verify 图的桶）。
+        #: 每拍 += m，比真实 start 大，但选桶只需要"装得下"，所以是安全的。
+        self._zos_ub: list[int] = [0] * self.max_bs
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -759,15 +762,33 @@ class ModelRunner:
                 self.batch.block_tables[:bs],
             )
 
-        it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
-        with attention_context(self._meta):
-            hidden = self.model(
-                self.batch.input_ids[:n_tokens],
-                self.batch.positions[:n_tokens],
-                self._prefill_attn(bs, n_tokens, m, self.config.context_len, True),
-                it,
-                self._ensure_aux(n_tokens),
-            )
+        # 选桶用 host 上界（ub 每拍 += m，只会偏大），装得下就复用录好的图；
+        # 装不下退回 eager。这正是把"丢了 verify 图"的 2.36× 拿回来的地方。
+        ub = max(self._zos_ub[:bs]) + m
+        graph = None
+        for bound in self._verify_buckets:
+            cand = self._verify_graphs.get((bs, m, bound))
+            if cand is not None and ub <= bound:
+                graph = cand
+                break
+        if graph is not None:
+            graph.replay()
+            hidden = self._verify_out[:n_tokens]
+        else:
+            it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
+            with attention_context(self._meta):
+                hidden = self.model(
+                    self.batch.input_ids[:n_tokens],
+                    self.batch.positions[:n_tokens],
+                    self._prefill_attn(bs, n_tokens, m, self.config.context_len, True),
+                    it,
+                    self._ensure_aux(n_tokens),
+                )
+        # 本拍写完 m 个位置 → 下一拍的上界 +m（不推进的话 ub 会落后于真实 start，
+        # 桶就可能"判成装得下"而实际越界）
+        for i in range(bs):
+            self._zos_ub[i] += m
+
         if not self.is_last_pp:
             self._send_intermediate(hidden)
             return None
@@ -952,6 +973,8 @@ class ModelRunner:
                 # 存**本拍的起点**，不是下一拍的：_verify_zos 里会再加 advances，
                 # 这里加就重复推进了（实测会多推一个 1+j）。
                 self._zos_start[i] = s0.num_cached_tokens
+                # 同步拍的 host 值精确，正好用来重锚上界
+                self._zos_ub[i] = s0.num_cached_tokens
 
         # 投机 + ZOS：把设备侧裁决结果整理成两个 [bs] 张量（下一拍的输入与推进量）。
         # 当前 ZOS 还不接受投机（verify 的元数据仍是 CPU 建的），这里只做落位，
