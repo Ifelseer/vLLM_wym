@@ -33,6 +33,11 @@ class _SpecSamples:
 
     tokens: list[int] = field(default_factory=list)
     lens: list[int] = field(default_factory=list)
+    #: ZOS 用：设备侧的产出（`[bs, m]` 打包 token 与 `[bs]` 每行 token 数）。
+    #: 非 None 时 `tokens`/`lens` 为空，改由 `_stage_samples` 异步拷回、`read_samples`
+    #: 解包——这样 verify 里就不需要 `.tolist()` 这种阻塞同步。
+    dev_tokens: torch.Tensor | None = None
+    dev_lens: torch.Tensor | None = None
     #: 每序列**提出**的草稿数（worker 侧起草时调度器算不出来，只能回传）
     proposed: list[int] = field(default_factory=list)
 
@@ -146,6 +151,8 @@ class ModelRunner:
         self._stage_used = [False, False]
         # (slot, n_p, n_d, spec) FIFO：read_samples 永远消费最老的一份
         self._staged: deque[tuple[int, int, int, "_SpecSamples | None"]] = deque()
+        # ZOS 投机：每行的产出 token 数（与 tokens 同一次异步回传的两个区域）
+        self._spec_lens_cpu = torch.empty(max_bs, dtype=torch.int32, pin_memory=True)
         # 投机 decode 的同步结果（普通 decode 复用 _sample_cpu 的异步 D2H）
         self._spec: _SpecSamples | None = None
 
@@ -1081,9 +1088,11 @@ class ModelRunner:
         spec = d if isinstance(d, _SpecSamples) else None
         self._spec = spec
         n_p = 0 if p is None else p.numel()
+        spec_dev = spec is not None and spec.dev_tokens is not None
         if spec is not None:
-            # 投机路径的 token 已在 _run_verify 里同步取回，不再走 pinned 缓冲
-            n_d = len(spec.tokens)
+            # 设备侧版本（ZOS）：tokens 是 `[bs, m]` 的 packed 张量，需异步拷回；
+            # 旧路径的 token 已在 _run_verify 里同步取回，不再走 pinned 缓冲。
+            n_d = int(spec.dev_tokens.numel()) if spec_dev else len(spec.tokens)
         else:
             n_d = 0 if d is None else d.numel()
 
@@ -1101,7 +1110,13 @@ class ModelRunner:
         cur = torch.cuda.current_stream()
         self._copy_stream.wait_stream(cur)
         with torch.cuda.stream(self._copy_stream):
-            if spec is None and d is not None:
+            if spec_dev:
+                assert spec is not None and spec.dev_tokens is not None
+                buf[:n_d].copy_(spec.dev_tokens.reshape(-1), non_blocking=True)
+                bs_ = int(spec.dev_tokens.shape[0])
+                assert spec.dev_lens is not None
+                self._spec_lens_cpu[:bs_].copy_(spec.dev_lens, non_blocking=True)
+            elif spec is None and d is not None:
                 buf[:n_d].copy_(d, non_blocking=True)
             if p is not None:
                 buf[n_d : n_d + n_p].copy_(p, non_blocking=True)
@@ -1130,6 +1145,18 @@ class ModelRunner:
         self._stage_used[slot] = False
         p_ids = buf[n_d : n_d + n_p].tolist() if n_p else []
         if spec is not None:
+            if spec.dev_tokens is not None:
+                # ZOS：从 pinned 上解包（tokens 是 [bs, m] 的 packed，lens 是每行真实产出数）
+                bs_, m_ = spec.dev_tokens.shape
+                flat = buf[:n_d].tolist()
+                lens = self._spec_lens_cpu[:bs_].tolist()
+                d_ids: list[int] = []
+                d_lens: list[int] = []
+                for r in range(bs_):
+                    take = int(lens[r])
+                    d_ids.extend(flat[r * m_ : r * m_ + take])
+                    d_lens.append(take)
+                return p_ids, d_ids, d_lens, list(spec.proposed) or None
             return (
                 p_ids,
                 list(spec.tokens),
