@@ -7,6 +7,7 @@ import torch
 from ..config import EngineConfig
 from ..data import SchedulerOutput, SeqSchedule
 from ..spec.verify import accept_greedy, accept_rejection
+from .decode_inputs import advance_decode
 from ..distributed import (
     IntermediateTensors,
     get_pp_group,
@@ -442,7 +443,23 @@ class ModelRunner:
         self._pp_send["residual"][:bs].copy_(out["residual"])
         return out
 
-    def _run_decode(self, seqs: list[SeqSchedule]):
+    def _run_decode(
+        self,
+        seqs: list[SeqSchedule],
+        *,
+        device_advance: tuple[torch.Tensor, torch.Tensor] | None = None,
+        refresh_tables: bool = False,
+    ):
+        """decode 前向。
+
+        ``device_advance=(tokens, advances)``：ZOS 模式下 CPU 状态落后一拍，
+        **不要**用 `build_decode` 重建输入，改由 :func:`advance_decode` 在设备缓冲上
+        就地推进（`tokens` 是上一轮的采样结果，`advances` 每行 1 或 1+j）。
+
+        此时调用方仍需保证两件事：① ``seq.block_table`` 已为下一位置预留过页
+        （`plan_lookahead` 里的 `kv.reserve`）；② 换页时传 ``refresh_tables=True``，
+        否则设备页表还是旧的、slot 会指向错的页。
+        """
         if not seqs:
             return None
         if (
@@ -463,7 +480,19 @@ class ModelRunner:
             if self.cuda_graph_runner is not None and bs <= self.max_bs
             else None
         )
-        self.batch.build_decode(seqs, pad_to=pad_to)
+        if device_advance is not None:
+            tokens, advances = device_advance
+            if refresh_tables:
+                # 换页后必须把新页表推下去；CPU 侧的 block_table 已由 kv.reserve
+                # 提前扩展，行序也与上一拍一致，所以可以直接按 sid 同步。
+                self.batch._sync_block_tables(seqs, tuple(s.seq_id for s in seqs))
+            advance_decode(self.batch, tokens, advances, bs, self.block_size)
+            if pad_to is not None and pad_to > bs:
+                # 补位行必须失效，否则图里会写到已退役序列的 KV 上
+                self.batch.slot_mapping[bs:pad_to].fill_(-1)
+                self.batch.cache_seqlens[bs:pad_to].zero_()
+        else:
+            self.batch.build_decode(seqs, pad_to=pad_to)
         if self._fp8_kv is not None:
             self._plan_decode_fp8(bs, pad_to)
 
