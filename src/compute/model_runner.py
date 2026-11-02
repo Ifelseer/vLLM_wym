@@ -6,7 +6,7 @@ import torch
 
 from ..config import EngineConfig
 from ..data import SchedulerOutput, SeqSchedule
-from ..spec.verify import accept_greedy, accept_rejection
+from ..spec.verify import accept_greedy, accept_greedy_device, accept_rejection
 from .decode_inputs import advance_decode
 from ..distributed import (
     IntermediateTensors,
@@ -67,6 +67,9 @@ class ModelRunner:
         self._dspark_pending: dict[int, torch.Tensor] = {}
         # 每序列的草稿分布（长度 = bs；None 表示该序列是确定性草稿）
         self._draft_probs: list[torch.Tensor | None] = []
+        # ZOS：本拍在设备上算出的 (next_token, advances, tokens)，供控制器下一拍直接使用
+        # （不需要 D2H）。长度 = 本拍序列数；长度不变时行序与上一拍一致。
+        self._zos_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -647,6 +650,7 @@ class ModelRunner:
             per.append((s, d))
         ms = [1 + len(d) for _, d in per]
         n_tokens = sum(ms)
+        self._zos_rows = []
 
         vseqs = [
             SeqSchedule(
@@ -709,7 +713,25 @@ class ModelRunner:
             m = ms[i]
             rows = logits[off : off + m]
             if self.batch.all_greedy:
-                toks, accepted = accept_greedy(d, rows.argmax(dim=-1).tolist())
+                preds_row = rows.argmax(dim=-1)
+                if self.config.zos_device_accept and self.config.enable_zos:
+                    # ZOS：裁决在设备侧算（不读回主机），结果留给控制器下一拍用。
+                    # 这一版仍走 CPU 结果输出，只做**对拍**——一旦不一致立刻能发现。
+                    nt, adv, tk = accept_greedy_device(
+                        torch.tensor([d], dtype=torch.long, device=self.device),
+                        preds_row.unsqueeze(0),
+                    )
+                    self._zos_rows.append((nt[0], adv[0], tk[0]))
+                toks, accepted = accept_greedy(d, preds_row.tolist())
+                if self._zos_rows:
+                    j_dev = int(self._zos_rows[-1][1]) - 1
+                    if j_dev != accepted:
+                        print(
+                            f"[WARN] zos accept 与 CPU 版不一致：device j={j_dev} "
+                            f"cpu j={accepted}（已回退 CPU 结果）",
+                            flush=True,
+                        )
+                        self._zos_rows.pop()
                 if self.config.spec_exact_kv:
                     # bit-exact：逐位置用 decode 内核重写 KV（含集合通信）
                     toks = self._kv_exact_rerun(s, d, accepted, toks)

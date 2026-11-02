@@ -96,6 +96,68 @@ def accept_rejection(
     return drafts[:j] + [token], j
 
 
+def accept_greedy_device(
+    drafts: torch.Tensor, preds: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """设备侧的 greedy 接受裁决（不经过主机）。
+
+    为什么需要：CPU 版的 ``accept_greedy`` 必须先把 logits 的 argmax **读回主机**才能
+    决定接受几个，形成一次全流水线同步点：
+
+    ```
+    GPU 算完 verify → .tolist()（等 GPU 排空）→ CPU 比较 → 下一轮
+    ```
+
+    设备版只做 elementwise 比较 + `cumprod` + 一次 gather，全程在 GPU 上，于是下一轮
+    的输入可以**直接从设备拿**（这是 ZOS 能覆盖投机的前提）。
+
+    一个能省掉大量工作的观察：``accept_greedy`` 返回的
+    ``drafts[:j] + [preds[j]]`` 的**最后一个元素恒为** ``preds[j]``，所以下一轮的 anchor
+    不需要把 tokens 拼出来，只需要 ``preds.gather(1, j)``。tokens 仍然打包返回，但只
+    用于**延迟一拍**的 D2H（追加 `token_ids` / 统计）。
+
+    Args:
+        drafts: ``[B, k]`` int64，本拍草稿（k 可为 0）。
+        preds: ``[B, k+1]`` int64，verify 各位置的 argmax。
+
+    Returns:
+        ``(next_token [B] int64, advances [B] int32, tokens [B, k+1] int64)``
+        - ``next_token``：下一轮的输入 token（= ``preds[j]``）；
+        - ``advances``：下一轮位置推进量（= ``1 + j``，直接喂 `advance_decode`）；
+        - ``tokens``：本拍实际产出的 ``1+j`` 个 token（第 ``j+1`` 位之后是 0，按
+          ``advances-1`` 切片）。
+
+    与 CPU 版逐位等价由 ``tests/unit/test_zos_accept.py`` 全枚举保证。
+    """
+    if preds.dim() != 2 or drafts.dim() != 2:
+        raise ValueError("accept_greedy_device expects 2-D tensors")
+    b, k = drafts.shape
+    if preds.shape[0] != b or preds.shape[1] != k + 1:
+        raise ValueError(
+            f"preds must be [B, k+1] = [{b}, {k + 1}], got {tuple(preds.shape)}"
+        )
+
+    rows = torch.arange(b, device=preds.device)
+    if k == 0:
+        j = torch.zeros(b, dtype=torch.long, device=preds.device)
+    else:
+        match = (preds[:, :k] == drafts).to(torch.int32)
+        # 最长可接受前缀：任一位置不匹配后，后面的 cumprod 全为 0
+        j = match.cumprod(dim=1).sum(dim=1).to(torch.long)
+
+    next_token = preds[rows, j]
+    advances = (j + 1).to(torch.int32)
+
+    # 打包 tokens：pos < j 取草稿，pos == j 取 next_token，其余补 0
+    drafts_pad = torch.cat(
+        [drafts, torch.zeros((b, 1), dtype=drafts.dtype, device=drafts.device)], dim=1
+    )
+    idx = torch.arange(k + 1, device=preds.device).unsqueeze(0)
+    tokens = torch.where(idx < j.unsqueeze(1), drafts_pad, torch.zeros_like(drafts_pad))
+    tokens = tokens.scatter(1, j.unsqueeze(1), next_token.unsqueeze(1))
+    return next_token, advances, tokens
+
+
 def accept_greedy(drafts: list[int], preds: list[int]) -> tuple[list[int], int]:
     """greedy 接受裁决。
 

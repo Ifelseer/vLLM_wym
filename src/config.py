@@ -123,6 +123,14 @@ class EngineConfig:
     # 等价性已由 CPU 单测保证（批量与单跑 token 逐位相同）。
     spec_draft_batch: bool = False
 
+    # --- ZOS（Zero-Overhead Scheduling）---
+    # 让下一轮提交提前到上一轮结果处理之前：GPU 用自己上一轮的输出当输入，CPU 在后面
+    # 追。默认开（参照 DeepInfer 在 NORMAL/COMPLETION 下 setdefault=1），不兼容的
+    # 组合由 config 校验自动关掉而不是报错。
+    enable_zos: bool = True
+    # 投机进 ZOS 的前提：接受裁决留在设备上（不 .tolist()）。可单独关掉以便只回退这一项。
+    zos_device_accept: bool = True
+
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
     quant_config: QuantConfig | None = field(init=False, default=None)
