@@ -51,7 +51,12 @@ from __future__ import annotations
 
 import torch
 
-__all__ = ["advance_decode", "advance_reference"]
+__all__ = [
+    "advance_decode",
+    "advance_reference",
+    "advance_verify",
+    "advance_verify_reference",
+]
 
 try:  # 允许在没有 Triton 的环境（CPU 单测）import 本模块
     import triton
@@ -126,6 +131,105 @@ def advance_decode(
         triton.next_power_of_2(bs),
         num_warps=4,
     )
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _advance_verify_kernel(
+        starts,  # [bs] int64：每行本拍的起始位置（= 已提交长度）
+        positions,  # [bs*M] int64
+        slots,  # [bs*M] int32
+        tables,  # [bs, WIDTH] int32
+        BS: tl.constexpr,
+        M: tl.constexpr,
+        WIDTH: tl.constexpr,
+        PAGE: tl.constexpr,
+        TILE_R: tl.constexpr,
+        TILE_M: tl.constexpr,
+    ):
+        r = tl.arange(0, TILE_R)[:, None]
+        t = tl.arange(0, TILE_M)[None, :]
+        valid = (r < BS) & (t < M)
+        start = tl.load(starts + r, mask=r < BS, other=0)
+        pos = start + t
+        page = tl.load(tables + r * WIDTH + pos // PAGE, mask=valid, other=0).to(tl.int64)
+        flat = r * M + t
+        tl.store(positions + flat, pos, mask=valid)
+        tl.store(slots + flat, (page * PAGE + pos % PAGE).to(tl.int32), mask=valid)
+
+
+def advance_verify(
+    data,
+    starts: torch.Tensor,
+    m: int,
+    block_size: int,
+) -> None:
+    """投机（verify）的设备侧元数据：按 ``starts`` 重写 positions / slot_mapping。
+
+    为什么 verify 不能沿用 `build_prefill`：它的 positions / slot_mapping /
+    cu_seqlens_k 全部由 **CPU 按 `num_cached_tokens` 构建**，而 ZOS 下 CPU 状态落后
+    一拍（真实起点是 `num_cached + 1 + j`，j 在设备上）——用它建出来就是错的位置。
+
+    这里只做二维（``[bs, m]``）的 positions/slots；`cu_seqlens_k` 用 torch 的
+    cumsum 直接写（`cum = cumsum(starts + m)`），不需要进 kernel。
+
+    Args:
+        data: ``Batch``，写 ``positions`` / ``slot_mapping`` / ``cu_seqlens_k``。
+        starts: ``[bs]`` int64，每行本拍**第一个待写位置**（device 上算出）。
+        m: 每行 token 数（= 1 + 草稿数，dspark 下恒为 k+1）。
+        block_size: KV 页大小。
+    """
+    assert _HAS_TRITON, "advance_verify requires triton"
+    bs = int(starts.numel())
+    n = bs * m
+    _advance_verify_kernel[(1,)](
+        starts,
+        data.positions,
+        data.slot_mapping,
+        data.block_tables,
+        bs,
+        m,
+        data.block_tables.shape[1],
+        block_size,
+        triton.next_power_of_2(max(1, bs)),
+        triton.next_power_of_2(max(1, m)),
+        num_warps=4,
+    )
+    # cu_seqlens_k：0, s0+m, s0+m+s1+m, ...
+    cum = torch.cumsum(starts.to(torch.int32) + m, dim=0)
+    data.cu_seqlens_k[1 : bs + 1].copy_(cum)
+    data.cu_seqlens_k[0] = 0
+    # 该段之外的位置必须失效，避免图里写到别的行
+    if data.slot_mapping.numel() > n:
+        data.slot_mapping[n:].fill_(-1)
+
+
+def advance_verify_reference(
+    *,
+    starts: torch.Tensor,
+    positions: torch.Tensor,
+    slots: torch.Tensor,
+    tables: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    m: int,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """纯 torch 版，供 CPU 单测对照（不依赖 Triton）。"""
+    positions = positions.clone()
+    slots = slots.clone()
+    cu = cu_seqlens_k.clone()
+    bs = int(starts.numel())
+    for r in range(bs):
+        for t in range(m):
+            pos = int(starts[r]) + t
+            page = int(tables[r, pos // block_size])
+            flat = r * m + t
+            positions[flat] = pos
+            slots[flat] = page * block_size + pos % block_size
+    cu[1 : bs + 1] = torch.cumsum(starts.to(torch.int32) + m, dim=0)
+    cu[0] = 0
+    return positions, slots, cu
 
 
 def advance_reference(
