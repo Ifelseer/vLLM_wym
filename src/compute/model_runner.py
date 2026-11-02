@@ -8,7 +8,7 @@ import torch
 from ..config import EngineConfig
 from ..data import SchedulerOutput, SeqSchedule
 from ..spec.verify import accept_greedy, accept_greedy_device, accept_rejection
-from .decode_inputs import advance_decode
+from .decode_inputs import advance_decode, advance_verify
 from ..distributed import (
     IntermediateTensors,
     get_pp_group,
@@ -81,6 +81,8 @@ class ModelRunner:
         # 投机 + ZOS：设备侧接受裁决给出的 (下一拍输入 token, 每行推进量)
         self._zos_next: torch.Tensor | None = None
         self._zos_adv: torch.Tensor | None = None
+        # ZOS+投机：每行的"下一拍起始位置"（设备侧精确值）
+        self._zos_start: torch.Tensor | None = None
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -537,6 +539,9 @@ class ModelRunner:
             # aux hidden，同时这条路径完全不进 decode CUDA Graph。
             # `_suppress_spec`：bit-exact 的逐位置重算要走**普通 decode**，
             # 否则会重新进入 verify → 无限递归。
+            if device_advance is not None and self.config.zos_spec:
+                # ZOS 提前一拍：输入全部由设备侧构造
+                return self._run_verify(seqs, zos=device_advance)
             return self._run_verify(seqs, drafts=self._propose_dspark(seqs))
         if self.config.spec_tokens > 0 and any(s.draft_ids for s in seqs):
             return self._run_verify(seqs)
@@ -688,8 +693,99 @@ class ModelRunner:
         return out
 
     @torch.inference_mode()
+    def _verify_zos(
+        self, seqs: list[SeqSchedule], zos: tuple[torch.Tensor, torch.Tensor]
+    ) -> "_SpecSamples | None":
+        """ZOS 下的 verify：输入全部由设备侧构造（方案 B 第 3 项 d）。
+
+        与 `_run_verify` 的差别：不调 `build_prefill`（它会用 CPU 的
+        `num_cached_tokens` 填位置，而 ZOS 下真实起点在设备上），改由
+        `advance_verify` 按设备 starts 写 positions/slot_mapping/cu_seqlens_k；
+        `input_ids` 由 `[anchor] + drafts` 在设备上拼；接受裁决整批一次算完，
+        结果留在设备侧（`_zos_next` / `_zos_adv`）供下一拍直接使用。
+
+        为了先拿到可验证的正确性，这里**走 eager**（不进 verify 图）：桶选择需要
+        host 侧上界 `ub`，那是下一步（第 4 项）。图可以后补，正确性不能后补。
+        """
+        anchors, advances = zos
+        dr = self._ensure_dspark()
+        if dr is None:
+            raise RuntimeError("zos_spec 需要 DSpark 草稿器")
+        bs = len(seqs)
+        k = self.config.spec_tokens
+        m = 1 + k
+        if self._zos_start is None:
+            self._zos_start = torch.zeros(
+                self.max_bs, dtype=torch.long, device=self.device
+            )
+        starts = self._zos_start[:bs] + advances.to(torch.long)
+        self._zos_start[:bs] = starts
+
+        ctxs: list[torch.Tensor] = []
+        segs: list[torch.Tensor] = []
+        for s in seqs:
+            c, seg = dr.take_pending(s.seq_id)
+            if c is None or seg is None:
+                raise RuntimeError(
+                    f"zos_spec: seq {s.seq_id} 缺少 pending ctx（update_full 未调用）"
+                )
+            ctxs.append(c)
+            segs.append(seg)
+        seg_t = torch.cat(segs).to(torch.long)
+
+        drafts_t, _probs = dr.propose_batch_ids(
+            [s.seq_id for s in seqs], anchors, starts, ctxs, segs=seg_t
+        )
+        ids_in = torch.cat(
+            [anchors.view(bs, 1).to(torch.long), drafts_t.to(torch.long)], dim=1
+        )
+
+        n_tokens = self.batch.bind_verify(bs, m)
+        self.batch.input_ids[:n_tokens].copy_(ids_in.reshape(-1))
+        advance_verify(self.batch, starts, m, self.block_size)
+        if self._fp8_kv is not None:
+            self._fp8_kv.plan_prefill(
+                self.batch.cu_seqlens_q[: bs + 1],
+                self.batch.cu_seqlens_k[: bs + 1],
+                self.batch.block_tables[:bs],
+            )
+
+        it = self._recv_intermediate(n_tokens) if not self.is_first_pp else None
+        with attention_context(self._meta):
+            hidden = self.model(
+                self.batch.input_ids[:n_tokens],
+                self.batch.positions[:n_tokens],
+                self._prefill_attn(bs, n_tokens, m, self.config.context_len, True),
+                it,
+                self._ensure_aux(n_tokens),
+            )
+        if not self.is_last_pp:
+            self._send_intermediate(hidden)
+            return None
+        if not self.is_driver:
+            return _SpecSamples()
+
+        preds = self.model.compute_logits(hidden).argmax(dim=-1).view(bs, m)
+        next_tok, adv, toks = accept_greedy_device(drafts_t, preds)
+        self._zos_next, self._zos_adv = next_tok, adv
+        aux = self._aux_buf
+        if aux is not None:
+            for i, s in enumerate(seqs):
+                dr.update_full(
+                    s.seq_id,
+                    aux[i * m : (i + 1) * m].clone().unsqueeze(0),
+                    adv[i : i + 1].to(torch.long),
+                )
+        return _SpecSamples(
+            dev_tokens=toks, dev_lens=adv.to(torch.long), proposed=[k] * bs
+        )
+
+    @torch.inference_mode()
     def _run_verify(
-        self, seqs: list[SeqSchedule], drafts: list[int] | None = None
+        self,
+        seqs: list[SeqSchedule],
+        drafts: list[int] | None = None,
+        zos: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> "_SpecSamples | None":
         """投机验证：一次因果前向算出 ``[anchor] + drafts`` 全部位置的 logits。
 
@@ -706,6 +802,9 @@ class ModelRunner:
         决策（决定 KV 账本），无法像普通 decode 那样只把 id 异步 D2H；v1 每次
         只读 ≤8 个整数，开销可忽略，Phase 5 再考虑把裁决整体搬到 GPU。
         """
+        if zos is not None:
+            return self._verify_zos(seqs, zos)
+
         n = len(seqs)
         per: list[tuple[SeqSchedule, list[int]]] = []
         for i, s in enumerate(seqs):
@@ -814,15 +913,35 @@ class ModelRunner:
                 toks, accepted = [], 0
             if self._dspark is not None and self._aux_buf is not None and self.is_driver:
                 # 草稿侧账本：本序列验证通过的位置的 hidden 是下一步的 context 段
-                self._dspark.update(
-                    s.seq_id,
-                    self._aux_buf[off : off + accepted + 1].clone().unsqueeze(0),
-                    start=s.num_cached_tokens + 1 + accepted,
-                )
+                if self.config.zos_spec:
+                    # ZOS：存整块 m + 设备 seg，不做 host 切片（accepted 只在设备上）
+                    self._dspark.update_full(
+                        s.seq_id,
+                        self._aux_buf[off : off + m].clone().unsqueeze(0),
+                        torch.tensor(
+                            [accepted + 1], dtype=torch.long, device=self.device
+                        ),
+                        start=s.num_cached_tokens + 1 + accepted,
+                    )
+                else:
+                    self._dspark.update(
+                        s.seq_id,
+                        self._aux_buf[off : off + accepted + 1].clone().unsqueeze(0),
+                        start=s.num_cached_tokens + 1 + accepted,
+                    )
             toks_all.extend(toks)
             lens.append(len(toks))
             off += m
         self._draft_probs = []
+        if self.config.zos_spec:
+            # 同步拍的 host 值是准的：用它播种设备侧起点（下一次 lookahead 的基准）
+            if self._zos_start is None:
+                self._zos_start = torch.zeros(
+                    self.max_bs, dtype=torch.long, device=self.device
+                )
+            for i, (s0, _d0) in enumerate(per):
+                self._zos_start[i] = s0.num_cached_tokens + lens[i]
+
         # 投机 + ZOS：把设备侧裁决结果整理成两个 [bs] 张量（下一拍的输入与推进量）。
         # 当前 ZOS 还不接受投机（verify 的元数据仍是 CPU 建的），这里只做落位，
         # 等 verify 也走设备侧推进后即可直接使用。
