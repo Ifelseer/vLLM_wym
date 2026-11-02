@@ -146,14 +146,8 @@ class Batch:
             每行的 token 数 `m` 与本批总 token 数 `bs * m` 中的后者（供调用方切缓冲）。
         """
         n = bs * m
-        (
-            self.input_ids,
-            self.positions,
-            self.slot_mapping,
-            self.cu_seqlens_q,
-            self.cu_seqlens_k,
-            self.block_tables,
-        ) = self._input_views(self._inputs, n, bs)
+        # 缓冲是常驻的（`_gpu(max_tokens)`），不需要重新绑定视图——
+        # 只要把 cu_seqlens_q 写成常量，其余字段由设备侧 kernel 写。
         self.cu_seqlens_q[: bs + 1].copy_(
             torch.arange(0, (bs + 1) * m, m, dtype=torch.int32, device=self.device)
         )

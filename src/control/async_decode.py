@@ -247,14 +247,16 @@ class AsyncDecode:
         普通 decode：token = 上一拍采样结果，advance 全 1。
         投机：两者都由设备侧接受裁决给出（步骤 B），此处直接取。
         """
-        tokens = prev.tokens_dev
-        if tokens is None:
-            raise RuntimeError("zos: previous round has no device tokens")
         if self.core.config.spec_tokens > 0:
+            # 投机拍产出的是 _SpecSamples，`tokens_dev` 本来就是 None，
+            # 所以这一支必须**先**判断，不能落到下面的 None 检查。
             nxt, adv = self.core.executor.last_accept()
             if nxt is None or adv is None:
                 raise RuntimeError("zos: spec decode without device-side accept")
             return nxt, adv
+        tokens = prev.tokens_dev
+        if tokens is None:
+            raise RuntimeError("zos: previous round has no device tokens")
         ones = torch.ones(
             tokens.numel(),
             dtype=torch.int32,
@@ -273,11 +275,22 @@ class AsyncDecode:
         # 拿它比 EOS 会漏 fence，在途那拍就会写进马上被释放的页。
         p_ids, d_ids, d_lens, d_prop = core.executor.read_samples(prev.n_p, prev.n_d)
 
+        # 真实 Scheduler 里 eos 可能是 int（不是 frozenset），`tid in eos` 会 TypeError
         eos = core.scheduler.eos
+        eos_set = eos if isinstance(eos, (set, frozenset)) else {eos}
+        # 投机一拍产出 1+j 个 token（d_ids 是扁平的），普通 decode 一行一个。
+        # 用 d_lens 把"每行的第一个 token"挑出来再判断结束。
+        if d_lens:
+            produced, off = [], 0
+            for n_i in d_lens:
+                produced.append(d_ids[off] if off < len(d_ids) else -1)
+                off += n_i
+        else:
+            produced = list(d_ids[: len(seqs)])
         will_finish = any(
-            (not s.ignore_eos and tid in eos)
+            (not s.ignore_eos and tid in eos_set)
             or s.num_completion_tokens + 1 >= s.max_tokens
-            for s, tid in zip(seqs, d_ids)
+            for s, tid in zip(seqs, produced)
         )
         may_remap = (
             core.config.prefix_backend == "radix"

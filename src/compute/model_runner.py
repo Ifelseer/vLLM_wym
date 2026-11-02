@@ -742,6 +742,9 @@ class ModelRunner:
 
         n_tokens = self.batch.bind_verify(bs, m)
         self.batch.input_ids[:n_tokens].copy_(ids_in.reshape(-1))
+        # 跨页时必须先把设备页表刷一遍：这条路径绕过了 build_decode/build_prefill，
+        # 不会自己同步；不刷新就会按旧页表算 slot。
+        self.batch._sync_block_tables(seqs, tuple(s.seq_id for s in seqs))
         advance_verify(self.batch, starts, m, self.block_size)
         if self._fp8_kv is not None:
             self._fp8_kv.plan_prefill(
@@ -940,7 +943,9 @@ class ModelRunner:
                     self.max_bs, dtype=torch.long, device=self.device
                 )
             for i, (s0, _d0) in enumerate(per):
-                self._zos_start[i] = s0.num_cached_tokens + lens[i]
+                # 存**本拍的起点**，不是下一拍的：_verify_zos 里会再加 advances，
+                # 这里加就重复推进了（实测会多推一个 1+j）。
+                self._zos_start[i] = s0.num_cached_tokens
 
         # 投机 + ZOS：把设备侧裁决结果整理成两个 [bs] 张量（下一拍的输入与推进量）。
         # 当前 ZOS 还不接受投机（verify 的元数据仍是 CPU 建的），这里只做落位，
