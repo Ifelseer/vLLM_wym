@@ -88,7 +88,12 @@ class AsyncDecode:
             memory_drains=0,
             eos_fences=0,
             prefix_fences=0,
+            ub_drains=0,
         )
+        # 每 N 拍强制 drain 一次，把 ub（host 上界）用精确值重锚。
+        # 不做的话 ub 只增不减，长生成最终所有桶都装不下 → 全部回退 eager。
+        self._lookahead_streak = 0
+        self._max_lookahead = 32
         #: 行序在两拍之间是否变过（换页需要刷新设备页表）
         self._tables_dirty = False
 
@@ -175,6 +180,11 @@ class AsyncDecode:
         ):
             self.stats["terminal_drains"] += 1
             return False
+        if self._lookahead_streak >= self._max_lookahead:
+            # 周期性退回同步拍：那一拍 host 值是精确的，正好把 ub 重锚回去
+            self.stats["ub_drains"] += 1
+            self._lookahead_streak = 0
+            return False
 
         # 提前一拍要覆盖到 num_cached + n（投机为 1+k，普通为 1）
         n = 1 + max(0, self.core.config.spec_tokens)
@@ -196,6 +206,7 @@ class AsyncDecode:
         self._tables_dirty = self._tables_dirty or (
             [len(s.block_table) for s in seqs] != before
         )
+        self._lookahead_streak += 1
         return True
 
     # ---------------------------------------------------------------- #
@@ -279,18 +290,20 @@ class AsyncDecode:
         eos = core.scheduler.eos
         eos_set = eos if isinstance(eos, (set, frozenset)) else {eos}
         # 投机一拍产出 1+j 个 token（d_ids 是扁平的），普通 decode 一行一个。
-        # 用 d_lens 把"每行的第一个 token"挑出来再判断结束。
+        # 结束判断必须按**每行全部产出**：① 任一 token 命中 EOS；② 本拍产出后
+        # 会达到 max_tokens（一次验证可能跨过上限，用 +1 会漏 fence）。
+        rows: list[tuple] = []
         if d_lens:
-            produced, off = [], 0
+            off = 0
             for n_i in d_lens:
-                produced.append(d_ids[off] if off < len(d_ids) else -1)
+                rows.append((d_ids[off : off + n_i], n_i))
                 off += n_i
         else:
-            produced = list(d_ids[: len(seqs)])
+            rows = [(d_ids[i : i + 1], 1) for i in range(len(seqs))]
         will_finish = any(
-            (not s.ignore_eos and tid in eos_set)
-            or s.num_completion_tokens + 1 >= s.max_tokens
-            for s, tid in zip(seqs, produced)
+            (not s.ignore_eos and any(t in eos_set for t in toks))
+            or s.num_completion_tokens + n_i >= s.max_tokens
+            for s, (toks, n_i) in zip(seqs, rows)
         )
         may_remap = (
             core.config.prefix_backend == "radix"

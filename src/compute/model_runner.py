@@ -85,7 +85,8 @@ class ModelRunner:
         self._zos_start: torch.Tensor | None = None
         #: ZOS+投机：每行起始位置的**host 上界**（用于选 verify 图的桶）。
         #: 每拍 += m，比真实 start 大，但选桶只需要"装得下"，所以是安全的。
-        self._zos_ub: list[int] = [0] * self.max_bs
+        # 注意：这里 `self.max_bs` 还没赋值（在后面），所以用 config 的值。
+        self._zos_ub: list[int] = [0] * min(int(config.max_num_seqs), 256)
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
