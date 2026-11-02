@@ -130,6 +130,9 @@ class EngineConfig:
     enable_zos: bool = True
     # 投机进 ZOS 的前提：接受裁决留在设备上（不 .tolist()）。可单独关掉以便只回退这一项。
     zos_device_accept: bool = True
+    # 投机也进 ZOS 流水线（方案 B：草稿按 m 追加 + 设备侧有效位 + ub 上界选桶）。
+    # 默认关：它依赖 verify 的设备侧元数据与整批设备裁决，需先通过 GPU 逐 token 对照。
+    zos_spec: bool = False
 
     @property
     def zos_enabled(self) -> bool:

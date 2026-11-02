@@ -147,7 +147,7 @@ class AsyncDecode:
         """
         if sched.prefills or not sched.decodes:
             return False
-        if self.core.config.spec_tokens > 0:
+        if self.core.config.spec_tokens > 0 and not self.core.config.zos_spec:
             return False
         if len(sched.decodes) > self.core.config.max_num_seqs:
             return False
