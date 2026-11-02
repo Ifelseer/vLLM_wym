@@ -105,18 +105,25 @@ class EngineCore:
             return self.async_decode.step()
         return self._step_sync()
 
-    def _step_sync(self) -> tuple[list[EngineCoreOutput], int]:
-        """
-            执行一步完整推理：调度 → 前向 → 采样 → 后处理。
+    def _step_sync(
+        self, sched: ScheduledBatch | None = None
+    ) -> tuple[list[EngineCoreOutput], int]:
+        """同步路径的一步。
 
-            Returns:
-                (outputs, metric)
-                - outputs：本步有增量产出的请求列表（新 token / 完成状态）。
-                - metric：本步处理的 token 总数（prefill tokens + decode 请求数），
-                        用于上层统计吞吐。
+        ``sched`` 可由调用方传入：ZOS 控制器已经 `schedule()` 过一次来判断"这批能不
+        能进流水线"，回落到这里时**必须复用那一批**——再 schedule() 一次会把刚被移到
+        running 的 prefill 序列当成 decode 行（num_scheduled_tokens 变成 1），
+        prefill 就再也不会跑了。
+
+        Returns:
+            (outputs, metric)
+            - outputs：本步有增量产出的请求列表（新 token / 完成状态）。
+            - metric：本步处理的 token 总数（prefill tokens + decode 请求数），
+                    用于上层统计吞吐。
         """
         # ---- 调度 ----
-        sched: ScheduledBatch = self.scheduler.schedule()
+        if sched is None:
+            sched = self.scheduler.schedule()
 
         if sched.is_empty():
             # 调度器没有产出，但仍有未完成请求。

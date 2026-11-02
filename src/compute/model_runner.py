@@ -436,6 +436,18 @@ class ModelRunner:
         """等异步回读落地（ZOS 的 fence 用：在动 CPU 状态前把在途那拍等完）。"""
         self._copy_stream.synchronize()
 
+    def discard_pending(self) -> None:
+        """丢掉最近一份尚未消费的回读（ZOS 丢弃在途 ticket 时必须成对调用）。
+
+        否则那条记录留在 FIFO 里，下一次 `read_samples` 会先弹出它——把上一批的
+        token 记到新一批的序列头上。
+        """
+        if not self._staged:
+            return
+        slot, _n_p, _n_d, _spec = self._staged.pop()
+        self._copy_event[slot].synchronize()
+        self._stage_used[slot] = False
+
     def run_decode_advance(
         self,
         seqs: list[SeqSchedule],

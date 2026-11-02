@@ -51,7 +51,7 @@ from dataclasses import dataclass
 
 import torch
 
-from ..data import ScheduledBatch, SeqSchedule
+from ..data import ScheduledBatch
 
 __all__ = ["AsyncDecode", "DecodeTicket"]
 
@@ -103,7 +103,8 @@ class AsyncDecode:
         if self.pending is None:
             sched = core.scheduler.schedule()
             if not self._eligible(sched):
-                return core._step_sync()  # 非稳定 decode：走原路径
+                # 复用刚排好的批：再 schedule() 一次会把刚落地的 prefill 当成 decode
+                return core._step_sync(sched)
             self.pending = self._submit(sched)
             # 首拍不返回任何 token：这一拍的结果下一拍才被消费
             return [], len(sched.decodes)
@@ -119,8 +120,10 @@ class AsyncDecode:
         outputs = self._consume(prev, nxt)
         if nxt is not None and all(s.is_finished for s in nxt.seqs):
             # 消费完这一拍后全部结束了：在途那拍的结果不再需要，等它落地后丢弃
-            # （不等的话，下一拍可能写进已释放的页）
+            # （不等的话，下一拍可能写进已释放的页）。**同时要丢掉它的回读条目**，
+            # 否则下一次 `read_samples` 会先弹出这条过期数据，把 token 记到别人头上。
             core.executor.sync_samples()
+            core.executor.discard_pending()
             nxt = None
         self.pending = nxt
         return outputs, (len(nxt.seqs) if nxt is not None else 0)
@@ -175,10 +178,18 @@ class AsyncDecode:
 
         # 提前一拍要覆盖到 num_cached + n（投机为 1+k，普通为 1）
         n = 1 + max(0, self.core.config.spec_tokens)
-        for s in seqs:
-            if not kv.can_append(s, n):
+        blocks = getattr(kv, "blocks", None)
+        if blocks is not None and hasattr(blocks, "needed_append"):
+            # **按总量判**：多行同时跨页时，逐行 `can_append` 各自都能过，
+            # 合计需求却可能超过可用页
+            if sum(blocks.needed_append(s, n) for s in seqs) > blocks.available_slots:
                 self.stats["memory_drains"] += 1
                 return False
+        else:
+            for s in seqs:
+                if not kv.can_append(s, n):
+                    self.stats["memory_drains"] += 1
+                    return False
         before = [len(s.block_table) for s in seqs]
         for s in seqs:
             kv.may_append(s, n)
@@ -206,12 +217,17 @@ class AsyncDecode:
         """用 prev 的设备侧采样结果，直接提交下一拍。"""
         seqs = prev.seqs
         tokens, advances = self._next_input(prev)
-        wire = ScheduledBatch(
-            decodes=[self._lagged_schedule(s) for s in seqs],
-            prefills=[],
-        )
+        # 必须放**真实 Sequence**：`to_wire()` 按 Sequence 取 last_token/draft_ids
+        # 并断言 len(token_ids)==num_cached+1；而且下一拍 `update` 要用它 append。
+        wire = ScheduledBatch(decodes=list(seqs), prefills=[])
+        # radix 后端内部 remap 时，`_sync_block_tables` 的快速比对（只看首/末/长度）
+        # 可能判成「没变」而跳过 H2D → 保守起见每次都刷页表（一次小 H2D，值这个确定性）
         n_p, n_d = self.core.executor.run_decode_advance(
-            wire, tokens, advances, refresh_tables=self._tables_dirty
+            wire,
+            tokens,
+            advances,
+            refresh_tables=self._tables_dirty
+            or self.core.config.prefix_backend == "radix",
         )
         self._tables_dirty = False
         self.stats["submitted"] += 1
@@ -246,28 +262,22 @@ class AsyncDecode:
         )
         return tokens, ones
 
-    @staticmethod
-    def _lagged_schedule(seq) -> SeqSchedule:
-        """构造下一拍的调度行。
 
-        ZOS 下 CPU 状态落后一拍，这里**只用** `seq_id` 与 `block_table`
-        （推进由设备侧 kernel 完成）；位置/长度等字段不会被读取，填滞后值即可。
-        """
-        return SeqSchedule(
-            seq_id=seq.seq_id,
-            block_table=seq.block_table,
-            num_cached_tokens=seq.num_cached_tokens,
-            token_ids=[seq.last_token],
-        )
 
     def _consume(self, prev: DecodeTicket, ahead: DecodeTicket | None) -> list:
         core = self.core
         seqs = prev.seqs
 
+        # 先回读，再判断"是否结束"——因为要判断的是**本拍产出的 token**。
+        # 用 `s.last_token` 是错的：那是本拍的**输入** token（CPU 状态落后一拍），
+        # 拿它比 EOS 会漏 fence，在途那拍就会写进马上被释放的页。
+        p_ids, d_ids, d_lens, d_prop = core.executor.read_samples(prev.n_p, prev.n_d)
+
+        eos = core.scheduler.eos
         will_finish = any(
-            (not s.ignore_eos and s.last_token in core.scheduler.eos)
+            (not s.ignore_eos and tid in eos)
             or s.num_completion_tokens + 1 >= s.max_tokens
-            for s in seqs
+            for s, tid in zip(seqs, d_ids)
         )
         may_remap = (
             core.config.prefix_backend == "radix"
@@ -278,8 +288,8 @@ class AsyncDecode:
             )
         )
         if ahead is not None and (will_finish or may_remap):
-            # 先把在途那拍等完：随后 postprocess 会释放页 / radix 会换页，
-            # 而在途计算还在写这些页
+            # 把在途那拍等完：随后 update 会释放页 / radix 会换页，
+            # 而在途计算还在往这些页里写
             core.executor.sync_samples()
             if will_finish:
                 self.stats["eos_fences"] += 1
@@ -287,5 +297,9 @@ class AsyncDecode:
                 self.stats["prefix_fences"] += 1
                 self._tables_dirty = True
 
-        p_ids, d_ids, d_lens, d_prop = core.executor.read_samples(prev.n_p, prev.n_d)
+        # 提前提交那拍的 batch 没有经过 scheduler.schedule()，`num_scheduled_tokens`
+        # 还是上一拍 update 末尾清成的 0；不重置就会 `num_cached_tokens += 0`
+        # 而 token 却 append 了（下一拍 to_wire 断言 fail）。普通 decode 恒为 1。
+        for s in seqs:
+            s.num_scheduled_tokens = 1
         return core.scheduler.update(prev.sched, p_ids, d_ids, d_lens, d_prop)

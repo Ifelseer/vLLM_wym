@@ -298,6 +298,10 @@ class Worker:
         assert self.model_runner is not None
         self.model_runner.sync_samples()
 
+    def discard_pending(self) -> None:
+        assert self.model_runner is not None
+        self.model_runner.discard_pending()
+
     def read_samples(
         self, n_p: int, n_d: int
     ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:

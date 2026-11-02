@@ -137,6 +137,10 @@ class Executor(ABC):
         """等最近一拍的异步回读落地（fence 用）。"""
         return None
 
+    def discard_pending(self) -> None:
+        """丢掉最近一份未消费的回读（丢弃在途 ticket 时用）。"""
+        return None
+
     def collective_rpc(self, op: str, **payload) -> object:
         """向所有 Worker 广播控制命令。基类默认拒绝未知操作。"""
         raise ValueError(f"unknown control op: {op}")
@@ -278,6 +282,9 @@ class UniprocExecutor(Executor):
 
     def sync_samples(self) -> None:
         self.worker.sync_samples()
+
+    def discard_pending(self) -> None:
+        self.worker.discard_pending()
 
     def collective_rpc(self, op: str, **payload) -> object:
         """单进程下无需广播，直接本地执行。"""
