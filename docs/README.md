@@ -16,6 +16,7 @@
 | [dspark-spec.md](dspark-spec.md) | DSpark 上游规格核实：草稿结构/权重名/推理协议/精确配置，以及与本引擎的落差 |
 | [dspark-report.md](dspark-report.md) | **DSpark 落地报告**：架构决策、七个坑的根因、性能与官方对照、方法论沉淀、剩余工作 |
 | [dspark-reference-eval.md](dspark-reference-eval.md) | 用官方 DeepSpec eval 作 accept_len 参照：独立 venv、任务裁剪、口径对齐 |
+| [zos-report.md](zos-report.md) | **ZOS 实现报告**：设备侧推进 / 设备侧裁决 / 控制器设计，三个阻塞 bug 的根因，实测收益（0.6B p50 -4.7%）与适用范围 |
 
 ## 代码地图
 
