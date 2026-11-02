@@ -721,6 +721,12 @@ class ModelRunner:
         starts = self._zos_start[:bs] + advances.to(torch.long)
         self._zos_start[:bs] = starts
 
+        # 首拍同步 verify 走的是单序列 propose()（DynamicCache）；ahead 走
+        # propose_batch_ids()（PaddedKVCache）。切换前把 prompt K/V 搬过去，
+        # 否则后续草稿看不到整段历史，accept 率会掉（不报错）。
+        for s in seqs:
+            dr.seed_padded_from_past(s.seq_id)
+
         ctxs: list[torch.Tensor] = []
         segs: list[torch.Tensor] = []
         for s in seqs:

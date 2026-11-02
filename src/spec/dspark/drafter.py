@@ -72,6 +72,8 @@ class DSparkDrafter:
         # 批量化：seq_id → 行号（长期持有），以及共享的 padded KV
         self._row_of: dict[int, int] = {}
         self._padded: PaddedKVCache | None = None
+        #: 已把 `DynamicCache` 的 prompt K/V 搬进 padded 行的序列（ZOS 切换用）
+        self._padded_seeded: set[int] = set()
         self.max_ctx_len = int(max_ctx_len)
         self.max_rows = int(max_rows)
 
@@ -81,9 +83,11 @@ class DSparkDrafter:
 
     def reset(self, seq_id: int) -> None:
         self._state.pop(seq_id, None)
+        self._padded_seeded.discard(seq_id)
 
     def clear(self) -> None:
         self._state.clear()
+        self._padded_seeded.clear()
 
     def ctx_len(self, seq_id: int) -> int:
         st = self._state.get(seq_id)
@@ -359,6 +363,17 @@ class DSparkDrafter:
         ctx, seg = st.pending_ctx, st.pending_seg
         st.pending_ctx, st.pending_seg = None, None
         return ctx, seg
+
+    def seed_padded_from_past(self, seq_id: int) -> None:
+        """ZOS：把首拍 `propose()` 的 prompt K/V 初始化到 padded 行（只做一次）。"""
+        if seq_id in self._padded_seeded:
+            return
+        st = self._state.get(seq_id)
+        if st is None:
+            return
+        row = self._row(seq_id)
+        if self._ensure_padded().seed_from_dynamic(row, st.past) > 0:
+            self._padded_seeded.add(seq_id)
 
     def reset_seq(self, seq_id: int) -> None:
         """释放一条序列的草稿状态与 KV 行。"""

@@ -104,6 +104,60 @@ class PaddedKVCache:
         self.valid[row].zero_()
         self.valid[row, :n] = True
 
+    def seed_from_dynamic(self, row: int, past) -> int:
+        """把单序列 `DynamicCache` 里已提交的 K/V 拷进本行。
+
+        ZOS 的第一步（同步 verify）走 `propose()`，它用 `DynamicCache`；后续
+        ahead 走 `propose_batch_ids()`，用本类。两条路径的缓存不是同一个对象，
+        不把首拍的 prompt K/V 搬过来，后续草稿就只看得到最后一个 ctx 段——
+        accept 率会掉，但不会报错。所以切换时调用一次。
+
+        Returns:
+            实际搬过来的 token 数（0 表示没有可搬的内容）。
+        """
+        length = int(past.get_seq_length())
+        if length <= 0:
+            return 0
+        # transformers 4.5x 后期 / 5.x：DynamicCache.layers[i].keys/values；
+        # 老布局：DynamicCache.key_cache[i]。两套都兼容（只认老布局会静默返回 0）。
+        cache_layers = getattr(past, "layers", None)
+        if cache_layers is not None:
+            pairs = [
+                (getattr(layer, "keys", None), getattr(layer, "values", None))
+                for layer in cache_layers
+            ]
+        else:
+            key_cache = getattr(past, "key_cache", None)
+            value_cache = getattr(past, "value_cache", None)
+            if key_cache is None or value_cache is None:
+                return 0
+            pairs = [
+                (
+                    key_cache[i] if i < len(key_cache) else None,
+                    value_cache[i] if i < len(value_cache) else None,
+                )
+                for i in range(len(key_cache))
+            ]
+        for layer in range(self.num_layers):
+            k, v = pairs[layer] if layer < len(pairs) else (None, None)
+            if k is None or v is None or k.numel() == 0:
+                continue
+            if self.k[layer] is None:
+                self.k[layer] = torch.zeros(
+                    self.num_rows,
+                    k.shape[1],
+                    self.max_len,
+                    k.shape[3],
+                    dtype=self.dtype,
+                    device=self.device,
+                )
+                self.v[layer] = torch.zeros_like(self.k[layer])
+            n = min(length, int(k.shape[2]), self.max_len)
+            self.k[layer][row, :, :n] = k[0, :, :n].to(self.dtype)
+            self.v[layer][row, :, :n] = v[0, :, :n].to(self.dtype)
+        self.seed_row(row, min(length, self.max_len))
+        return min(length, self.max_len)
+
     # ---------------------------------------------------------------- #
     # 步进
     # ---------------------------------------------------------------- #
