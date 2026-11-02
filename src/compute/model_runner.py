@@ -73,6 +73,9 @@ class ModelRunner:
         self._zos_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         # 最近一拍 decode 的采样结果（device）；ZOS 下一拍直接拿它当输入
         self._last_decode_dev: torch.Tensor | None = None
+        # 投机 + ZOS：设备侧接受裁决给出的 (下一拍输入 token, 每行推进量)
+        self._zos_next: torch.Tensor | None = None
+        self._zos_adv: torch.Tensor | None = None
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -429,6 +432,10 @@ class ModelRunner:
         return self._stage_samples(p, d)
 
     @torch.inference_mode()
+    def sync_samples(self) -> None:
+        """等异步回读落地（ZOS 的 fence 用：在动 CPU 状态前把在途那拍等完）。"""
+        self._copy_stream.synchronize()
+
     def run_decode_advance(
         self,
         seqs: list[SeqSchedule],
@@ -797,6 +804,14 @@ class ModelRunner:
             lens.append(len(toks))
             off += m
         self._draft_probs = []
+        # 投机 + ZOS：把设备侧裁决结果整理成两个 [bs] 张量（下一拍的输入与推进量）。
+        # 当前 ZOS 还不接受投机（verify 的元数据仍是 CPU 建的），这里只做落位，
+        # 等 verify 也走设备侧推进后即可直接使用。
+        if self._zos_rows and len(self._zos_rows) == len(per):
+            self._zos_next = torch.stack([r[0] for r in self._zos_rows])
+            self._zos_adv = torch.stack([r[1] for r in self._zos_rows])
+        else:
+            self._zos_next, self._zos_adv = None, None
 
         if not self.is_driver:
             return _SpecSamples()

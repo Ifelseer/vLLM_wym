@@ -76,6 +76,12 @@ class EngineCore:
         self.kv: KVManager = self.executor.init_kv()
         self.scheduler = self._build_scheduler()
         self.last_num_cached_tokens = 0
+        # ZOS：默认开，但只在单进程（tp=pp=1）且非投机时生效
+        self.async_decode = None
+        if getattr(self.config, "zos_enabled", False):
+            from .async_decode import AsyncDecode
+
+            self.async_decode = AsyncDecode(self)
 
     # ------------------------------------------------------------------ #
     # 请求管理
@@ -94,6 +100,12 @@ class EngineCore:
     # ------------------------------------------------------------------ #
 
     def step(self) -> tuple[list[EngineCoreOutput], int]:
+        """一步推理。ZOS 打开时交给流水线控制器（不兼容的批会自动回落到同步路径）。"""
+        if self.async_decode is not None:
+            return self.async_decode.step()
+        return self._step_sync()
+
+    def _step_sync(self) -> tuple[list[EngineCoreOutput], int]:
         """
             执行一步完整推理：调度 → 前向 → 采样 → 后处理。
 

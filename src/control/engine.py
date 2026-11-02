@@ -188,6 +188,16 @@ class Engine:
     # 执行
     # ------------------------------------------------------------------ #
 
+    def zos_stats(self) -> dict:
+        """ZOS 计数器（未启用或非单进程时返回空 dict）。
+
+        用来判断"流水线到底有没有跑起来"：``lookahead_submitted`` 为 0 说明每拍都被
+        drain 掉了，此时即使输出正确也证明不了 ZOS 生效。
+        """
+        core = getattr(self._client, "engine_core", None)
+        ad = getattr(core, "async_decode", None) if core is not None else None
+        return dict(ad.stats) if ad is not None else {}
+
     def step(self) -> tuple[list[tuple[int, list[int]]], int]:
         """
             驱动一步推理：调度 → 前向 → 采样 → 后处理。

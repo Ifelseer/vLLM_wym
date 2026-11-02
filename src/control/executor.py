@@ -119,6 +119,24 @@ class Executor(ABC):
     @abstractmethod
     def destroy(self) -> None: ...
 
+    # ---- ZOS 需要的能力（单进程实现提供；分布式暂不支持）----
+
+    def last_decode_dev(self):
+        """最近一拍 decode 的采样结果（device 张量），供下一拍直接当输入。"""
+        return None
+
+    def last_accept(self) -> tuple[object, object]:
+        """投机：设备侧接受裁决给出的 (下一拍输入 token, 每行推进量)。"""
+        return None, None
+
+    def run_decode_advance(self, sched, tokens, advances, *, refresh_tables: bool = False):
+        """ZOS 提前提交：不重建输入，用设备缓冲就地推进。"""
+        raise NotImplementedError("ZOS requires a single-process executor")
+
+    def sync_samples(self) -> None:
+        """等最近一拍的异步回读落地（fence 用）。"""
+        return None
+
     def collective_rpc(self, op: str, **payload) -> object:
         """向所有 Worker 广播控制命令。基类默认拒绝未知操作。"""
         raise ValueError(f"unknown control op: {op}")
@@ -242,6 +260,24 @@ class UniprocExecutor(Executor):
         self, n_p: int, n_d: int
     ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
         return self.worker.read_samples(n_p, n_d)
+
+    # ---- ZOS ----
+
+    def last_decode_dev(self):
+        return self.worker.last_decode_dev()
+
+    def last_accept(self):
+        return self.worker.last_accept()
+
+    def run_decode_advance(self, sched, tokens, advances, *, refresh_tables: bool = False):
+        counts = self.worker.execute_model_advance(
+            sched.to_wire(), tokens, advances, refresh_tables=refresh_tables
+        )
+        assert counts is not None
+        return counts
+
+    def sync_samples(self) -> None:
+        self.worker.sync_samples()
 
     def collective_rpc(self, op: str, **payload) -> object:
         """单进程下无需广播，直接本地执行。"""

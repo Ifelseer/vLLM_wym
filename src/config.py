@@ -131,6 +131,16 @@ class EngineConfig:
     # 投机进 ZOS 的前提：接受裁决留在设备上（不 .tolist()）。可单独关掉以便只回退这一项。
     zos_device_accept: bool = True
 
+    @property
+    def zos_enabled(self) -> bool:
+        """ZOS 是否真正生效（默认开，但只在单进程下）。
+
+        ``pp>1`` 结构不支持（token 要反向回传 + 中间张量通道）；``tp>1`` 需要"每个
+        rank 同一张票"的协调层，尚未实现。``dp>1`` 不影响——每个副本各自跑一套
+        ZOS，零协调。
+        """
+        return bool(self.enable_zos) and self.tp_size == 1 and self.pp_size == 1
+
     hf_config: PretrainedConfig = field(init=False)
     is_moe: bool = field(init=False, default=False)
     quant_config: QuantConfig | None = field(init=False, default=None)

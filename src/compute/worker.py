@@ -274,6 +274,30 @@ class Worker:
             return None
         return result
 
+    def execute_model_advance(
+        self, sched: SchedulerOutput, tokens, advances, *, refresh_tables: bool = False
+    ) -> tuple[int, int] | None:
+        """ZOS 提前提交：用设备上的上一拍结果推进，不重建输入。"""
+        assert self.model_runner is not None
+        result = self.model_runner.run_decode_advance(
+            sched.decodes, tokens, advances, refresh_tables=refresh_tables
+        )
+        if not self.is_last_pp:
+            return None
+        return result
+
+    def last_decode_dev(self):
+        assert self.model_runner is not None
+        return self.model_runner._last_decode_dev
+
+    def last_accept(self):
+        assert self.model_runner is not None
+        return self.model_runner._zos_next, self.model_runner._zos_adv
+
+    def sync_samples(self) -> None:
+        assert self.model_runner is not None
+        self.model_runner.sync_samples()
+
     def read_samples(
         self, n_p: int, n_d: int
     ) -> tuple[list[int], list[int], list[int] | None, list[int] | None]:
