@@ -71,6 +71,8 @@ class ModelRunner:
         # ZOS：本拍在设备上算出的 (next_token, advances, tokens)，供控制器下一拍直接使用
         # （不需要 D2H）。长度 = 本拍序列数；长度不变时行序与上一拍一致。
         self._zos_rows: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        # 最近一拍 decode 的采样结果（device）；ZOS 下一拍直接拿它当输入
+        self._last_decode_dev: torch.Tensor | None = None
         # verify 的 CUDA Graph 分档（(m, 桶) -> graph）与静态输出缓冲
         self._verify_graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self._verify_buckets: list[int] = []
@@ -422,7 +424,32 @@ class ModelRunner:
         p = self._run_prefill(sched.prefills) if sched.prefills else None
         if not self.is_last_pp:
             return None
+        # ZOS 需要"上一拍的采样结果"仍在设备上（不能只有 pinned 副本）
+        self._last_decode_dev = d if isinstance(d, torch.Tensor) else None
         return self._stage_samples(p, d)
+
+    @torch.inference_mode()
+    def run_decode_advance(
+        self,
+        seqs: list[SeqSchedule],
+        tokens: torch.Tensor,
+        advances: torch.Tensor,
+        *,
+        refresh_tables: bool = False,
+    ) -> tuple[int, int]:
+        """ZOS 的"提前一拍"提交：不重建输入，用设备上的上一拍结果推进。
+
+        与 ``run_forward`` 的区别只有一处——不走 ``build_decode``（CPU 状态落后一拍，
+        用它建输入就是错的），改由 ``advance_decode`` 在常驻缓冲上推进。采样回读仍是
+        异步的（``_stage_samples``），所以本函数也不等待。
+        """
+        d = self._run_decode(
+            seqs, device_advance=(tokens, advances), refresh_tables=refresh_tables
+        )
+        if not self.is_last_pp:
+            return 0, 0
+        self._last_decode_dev = d if isinstance(d, torch.Tensor) else None
+        return self._stage_samples(None, d)
 
     def _decode_attn(self, bs: int) -> AttnInputs:
         return AttnInputs(
