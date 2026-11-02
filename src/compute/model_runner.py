@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 
 import torch
@@ -129,8 +130,17 @@ class ModelRunner:
         )
 
         self._copy_stream = torch.cuda.Stream(device=device)
-        self._copy_event = torch.cuda.Event()
-        self._sample_cpu = torch.empty(max_bs * 2, dtype=torch.int64, pin_memory=True)
+        # 两组 pinned 缓冲 + 两个 event 轮换：ZOS 下"提交 N+1"与"消费 N"会同时存在，
+        # 单缓冲会被下一拍覆写。
+        self._copy_event = [torch.cuda.Event(), torch.cuda.Event()]
+        self._sample_cpu = [
+            torch.empty(max_bs * 2, dtype=torch.int64, pin_memory=True)
+            for _ in range(2)
+        ]
+        self._stage_slot = 0
+        self._stage_used = [False, False]
+        # (slot, n_p, n_d, spec) FIFO：read_samples 永远消费最老的一份
+        self._staged: deque[tuple[int, int, int, "_SpecSamples | None"]] = deque()
         # 投机 decode 的同步结果（普通 decode 复用 _sample_cpu 的异步 D2H）
         self._spec: _SpecSamples | None = None
 
@@ -1007,6 +1017,13 @@ class ModelRunner:
     def _stage_samples(
         self, p: torch.Tensor | None, d: torch.Tensor | "_SpecSamples | None"
     ) -> tuple[int, int]:
+        """发起异步 D2H（不等待），返回 ``(n_p, n_d)``。
+
+        ZOS 下"提交"与"消费"会分开：提交第 N+1 拍时第 N 拍的回读可能还在飞。所以这里
+        用**两组 pinned 缓冲 + 两个 event 轮换**，并把 (slot, n_p, n_d) 压进 FIFO，
+        `read_samples` 永远消费**最老**的那一份——正常路径只有一份在飞，行为与原来
+        完全一致。
+        """
         spec = d if isinstance(d, _SpecSamples) else None
         self._spec = spec
         n_p = 0 if p is None else p.numel()
@@ -1015,17 +1032,28 @@ class ModelRunner:
             n_d = len(spec.tokens)
         else:
             n_d = 0 if d is None else d.numel()
+
+        slot = self._stage_slot
+        self._stage_slot ^= 1
+        buf = self._sample_cpu[slot]
+        evt = self._copy_event[slot]
         need = n_p + n_d
-        if need > self._sample_cpu.numel():
-            self._sample_cpu = torch.empty(need, dtype=torch.int64, pin_memory=True)
+        if need > buf.numel():
+            buf = torch.empty(need, dtype=torch.int64, pin_memory=True)
+            self._sample_cpu[slot] = buf
+        # 该槽位上一轮（两拍前）的回读必须先落地，否则会覆写还在飞的数据
+        if self._stage_used[slot]:
+            evt.synchronize()
         cur = torch.cuda.current_stream()
         self._copy_stream.wait_stream(cur)
         with torch.cuda.stream(self._copy_stream):
             if spec is None and d is not None:
-                self._sample_cpu[:n_d].copy_(d, non_blocking=True)
+                buf[:n_d].copy_(d, non_blocking=True)
             if p is not None:
-                self._sample_cpu[n_d : n_d + n_p].copy_(p, non_blocking=True)
-        self._copy_event.record(self._copy_stream)
+                buf[n_d : n_d + n_p].copy_(p, non_blocking=True)
+        evt.record(self._copy_stream)
+        self._stage_used[slot] = True
+        self._staged.append((slot, n_p, n_d, spec))
         return n_p, n_d
 
     def read_samples(
@@ -1037,16 +1065,24 @@ class ModelRunner:
         ``decode_proposed[i]`` = 第 i 条序列**提出**的草稿数——只有 worker 侧起草
         （dspark）时才非空；ngram 在调度器侧就统计过了，避免重复计数。
         """
-        self._copy_event.synchronize()
-        p_ids = self._sample_cpu[n_d : n_d + n_p].tolist() if n_p else []
-        if self._spec is not None:
+        # 消费**最老**的一份：ZOS 下可能有两份在飞（提交了 N+1、还没读 N）
+        if self._staged:
+            slot, n_p, n_d, spec = self._staged.popleft()
+        else:  # 兼容旧调用（没有 stage 记录时按参数走 0 号槽）
+            slot, spec = 0, self._spec
+        evt = self._copy_event[slot]
+        buf = self._sample_cpu[slot]
+        evt.synchronize()
+        self._stage_used[slot] = False
+        p_ids = buf[n_d : n_d + n_p].tolist() if n_p else []
+        if spec is not None:
             return (
                 p_ids,
-                list(self._spec.tokens),
-                list(self._spec.lens),
-                list(self._spec.proposed) or None,
+                list(spec.tokens),
+                list(spec.lens),
+                list(spec.proposed) or None,
             )
-        d_ids = self._sample_cpu[:n_d].tolist() if n_d else []
+        d_ids = buf[:n_d].tolist() if n_d else []
         return p_ids, d_ids, None, None
 
     def _resolve_compile_mode(self) -> str:
