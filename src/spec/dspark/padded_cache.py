@@ -65,6 +65,12 @@ class PaddedKVCache:
         self._rows: list[int] = []
         self._seg_rows: list[int] = []
         self._kv_len = 0
+        #: **host 镜像**：每行已写长度。用它算写入偏移与 kv_len，避免 `int(device_lens[r])`
+        #: 这种隐式同步（在 ZOS 下它会等上一拍算完，把 lookahead 掐死）。
+        self._lens_host: list[int] = [0] * self.num_rows
+        #: ZOS 模式：seg 由设备给出，`lens` 每拍按**常量** `seg_max` 推进（不按真实 1+j）
+        self._device_segs = False
+        self._seg_max = 0
 
     # ---------------------------------------------------------------- #
     # 行管理
@@ -74,6 +80,7 @@ class PaddedKVCache:
         """释放一行（序列结束 / 状态漂移）。"""
         self.lens[row] = 0
         self.valid[row].zero_()
+        self._lens_host[row] = 0
 
     def get_seq_length(self) -> int:
         """供 `Cache` 协议使用（部分调用方会问；取参与行的最大长度）。"""
@@ -93,6 +100,7 @@ class PaddedKVCache:
         """
         assert 0 <= n <= self.max_len
         self.lens[row] = n
+        self._lens_host[row] = n
         self.valid[row].zero_()
         self.valid[row, :n] = True
 
@@ -103,6 +111,7 @@ class PaddedKVCache:
     def begin_step(
         self, rows: list[int] | None = None, seg_rows: list[int] | None = None,
         seg_max: int = 0, block: int = 0,
+        device_segs: torch.Tensor | None = None,
     ) -> int:
         """登记本步新增区段的有效位，返回本步 attention 的 KV 长度。
 
@@ -114,22 +123,43 @@ class PaddedKVCache:
         """
         if rows is None:
             rows = self._rows
-        if seg_rows is None:
-            seg_rows = self._seg_rows
-        assert len(rows) == len(seg_rows)
+        rows = list(rows)
         new_len = seg_max + block
-        for r, seg in zip(rows, seg_rows):
-            s = int(self.lens[r])
-            end = s + new_len
-            assert end <= self.max_len, (
-                f"row {r} 需要 {end} > max_len={self.max_len}"
-            )
-            self.valid[r, s : s + seg] = True           # 真实 ctx 段
-            self.valid[r, s + seg_max : end] = True      # block 个候选
-        self._rows = list(rows)
-        self._seg_rows = list(seg_rows)
+        self._device_segs = device_segs is not None
+        self._seg_max = seg_max
+
+        if device_segs is not None:
+            # ZOS：seg 是**设备标量**（1+j），不能用来切 host 下标。
+            # 于是"按满 seg_max + block 追加"，有效位 = arange(m) < seg_i
+            # （host 切片 + device 掩码，不产生同步）；块段恒有效。
+            assert len(rows) == int(device_segs.numel())
+            t = torch.arange(new_len, device=self.device)
+            for i, r in enumerate(rows):
+                s = self._lens_host[r]
+                end = s + new_len
+                assert end <= self.max_len, (
+                    f"row {r} 需要 {end} > max_len={self.max_len}"
+                )
+                val = t < device_segs[i].to(torch.long)
+                val[seg_max:] = True
+                self.valid[r, s:end] = val
+        else:
+            if seg_rows is None:
+                seg_rows = self._seg_rows
+            assert len(rows) == len(seg_rows)
+            for r, seg in zip(rows, seg_rows):
+                s = self._lens_host[r]
+                end = s + new_len
+                assert end <= self.max_len, (
+                    f"row {r} 需要 {end} > max_len={self.max_len}"
+                )
+                self.valid[r, s : s + seg] = True           # 真实 ctx 段
+                self.valid[r, s + seg_max : end] = True      # block 个候选
+
+        self._rows = rows
+        self._seg_rows = list(seg_rows) if seg_rows is not None else []
         self._new_len = new_len
-        self._kv_len = int(self.lens[self._rows].max()) + new_len
+        self._kv_len = max(self._lens_host[r] for r in rows) + new_len
         return self._kv_len
 
     def update(
@@ -158,10 +188,12 @@ class PaddedKVCache:
 
         idx = torch.tensor(rows, dtype=torch.long, device=self.device)
         for i, r in enumerate(rows):
-            off = int(self.lens[r])
+            # 用 host 镜像而不是 `int(self.lens[r])`：后者是一次隐式 D2H 同步，
+            # 在 ZOS 下会等上一拍算完，把 lookahead 掐死。
+            off = self._lens_host[r]
             kk[r, :, off : off + length] = k[i]
             vv[r, :, off : off + length] = v[i]
-        kv_len = int(self.lens[idx].max()) + length
+        kv_len = self._kv_len or (max(self._lens_host[r] for r in rows) + length)
         return kk[idx][:, :, :kv_len], vv[idx][:, :, :kv_len]
 
     def mask(self, q_len: int, dtype: torch.dtype | None = None) -> torch.Tensor:
@@ -183,10 +215,18 @@ class PaddedKVCache:
 
     def crop(self) -> None:
         """块内候选的 KV 用完即弃（上游 ``crop(start)`` 的批量化版本）。"""
-        rows, seg_rows = self._rows, self._seg_rows
-        positions = torch.arange(self.max_len, device=self.device)
-        for r, seg in zip(rows, seg_rows):
-            keep = int(self.lens[r]) + seg
-            self.valid[r] &= positions < keep
-            self.lens[r] = keep
+        rows = self._rows
+        if self._device_segs:
+            # ZOS：长度按**常量** seg_max 推进（真实 1+j 只体现在 valid 上）。
+            # 多出来的部分是 mask 掉的，缓冲留 1.5 倍余量即可，不必压缩。
+            for r in rows:
+                self._lens_host[r] += self._seg_max
+                self.lens[r] = self._lens_host[r]
+        else:
+            positions = torch.arange(self.max_len, device=self.device)
+            for r, seg in zip(rows, self._seg_rows):
+                keep = self._lens_host[r] + seg
+                self.valid[r] &= positions < keep
+                self.lens[r] = keep
+                self._lens_host[r] = keep
         self._new_len = 0
