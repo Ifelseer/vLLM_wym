@@ -116,6 +116,17 @@ varlen 就行"：
 所以 A 是"把草稿 KV 从 dense padded 升级到 paged"的独立重构项，建议单独立项，
 不与 ZOS 绑在一起做。
 
+> **更新（已落地 P0~P2）**：页式草稿 KV 已实现并接入（`src/spec/dspark/paged_cache.py`），
+> 采用「读路径一：gather 成稠密后走现有 SDPA」，因此 **vendored attention 零改动**。
+> 页池容量从 `O(行数 × max_len)` 降到 `O(实际 token)`（128 token 场景 1.34 GB → ~42 MB），
+> 页号 int64 预留 `tier`/`device` 位，为 offload/多卡留接口。
+> 读路径二（`flash_attn_with_kvcache(block_table=)`）已就绪但**默认关且未在 GPU 验证**；
+> 经核实本仓对页大小有硬校验（必须 256 的倍数，FA2 paged 约束）。
+> 详见 `docs/draft-kv-paged-plan.md`。
+>
+> 对 ZOS 的含义：路径一仍需要 host 侧 `seg_max`（因此 `device_segs` 被 fail loud 拒绝），
+> **真正让投机 ZOS 零同步的是路径二**——这也是"页式是投机 ZOS 的地基"这句话的准确含义。
+
 ---
 
 ## 6. 已知边界

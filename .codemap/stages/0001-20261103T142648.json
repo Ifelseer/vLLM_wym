@@ -1,0 +1,985 @@
+{
+  "id": "0001",
+  "title": "ZOS 调度与草稿 KV 页式化",
+  "intent": "把「调度与计算重叠」（ZOS）落到本引擎，并把草稿 KV 从按行预留改为页池，为长上下文与多卡扩展留接口。",
+  "at": "2026-11-03T14:26:48",
+  "commit": "0b662b2",
+  "baseline_at": "2026-10-31T23:37:20",
+  "baseline_commit": "1c92356",
+  "summary": {
+    "files_added": 14,
+    "files_modified": 16,
+    "files_removed": 9,
+    "symbols_added": 143,
+    "symbols_removed": 6,
+    "symbols_changed": 5,
+    "nodes_touched": 8,
+    "nodes_impacted": 2,
+    "loc_delta": 2614
+  },
+  "files": [
+    {
+      "path": "bench/zos_bench.py",
+      "status": "added",
+      "loc_delta": 265,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "_pct",
+          "_run_one",
+          "main"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "docs/draft-kv-paged-plan.md",
+      "status": "added",
+      "loc_delta": 116,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "docs/zos-report.md",
+      "status": "added",
+      "loc_delta": 315,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "docs/zos-spec-plan.md",
+      "status": "added",
+      "loc_delta": 137,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/compute/decode_inputs.py",
+      "status": "added",
+      "loc_delta": 264,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "advance_decode",
+          "advance_reference",
+          "advance_verify",
+          "advance_verify_reference"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/control/async_decode.py",
+      "status": "added",
+      "loc_delta": 331,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "AsyncDecode",
+          "AsyncDecode.__init__",
+          "AsyncDecode._can_lookahead",
+          "AsyncDecode._consume",
+          "AsyncDecode._eligible",
+          "AsyncDecode._next_input",
+          "AsyncDecode._submit",
+          "AsyncDecode._submit_ahead",
+          "AsyncDecode.close",
+          "AsyncDecode.step",
+          "DecodeTicket",
+          "DecodeTicket.seqs"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/spec/dspark/paged_cache.py",
+      "status": "added",
+      "loc_delta": 503,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "PagedDraftKV",
+          "PagedDraftKV.__init__",
+          "PagedDraftKV._alloc_page",
+          "PagedDraftKV._pages_for",
+          "PagedDraftKV._pool",
+          "PagedDraftKV._release_page",
+          "PagedDraftKV._release_row_pages",
+          "PagedDraftKV._slots",
+          "PagedDraftKV.active_rows",
+          "PagedDraftKV.begin_step",
+          "PagedDraftKV.block_table",
+          "PagedDraftKV.crop",
+          "PagedDraftKV.fa_args",
+          "PagedDraftKV.get_seq_length",
+          "PagedDraftKV.mask",
+          "PagedDraftKV.num_free",
+          "PagedDraftKV.read_dense_layer",
+          "PagedDraftKV.reset_row",
+          "PagedDraftKV.row_len",
+          "PagedDraftKV.seed_from_dynamic",
+          "PagedDraftKV.seed_row",
+          "PagedDraftKV.update",
+          "PagedDraftKV.update_paged",
+          "decode_page",
+          "encode_page"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/gpu/test_dspark_paged_gpu.py",
+      "status": "added",
+      "loc_delta": 89,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "_run",
+          "test_paged_matches_dense_tokens",
+          "test_pool_exhaustion_degrades_but_stays_correct"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/gpu/test_zos_e2e.py",
+      "status": "added",
+      "loc_delta": 55,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "_run",
+          "test_zos_matches_sync_greedy"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_dspark_padded_cache_zos.py",
+      "status": "added",
+      "loc_delta": 106,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestDeviceSegs",
+          "TestDeviceSegs.test_context_slots_match_host_path",
+          "TestDeviceSegs.test_device_lens_advance_by_seg_max",
+          "TestDeviceSegs.test_mixed_host_and_device_rejected",
+          "TestDeviceSegs.test_pad_and_block_regions",
+          "_cache"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_dspark_paged_cache.py",
+      "status": "added",
+      "loc_delta": 197,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestCrop",
+          "TestCrop.test_crop_keeps_partial_page",
+          "TestCrop.test_crop_releases_tail_pages",
+          "TestCrop.test_second_step_continues",
+          "TestMask",
+          "TestMask.test_mask_follows_per_row_length",
+          "TestMask.test_pad_region_masked",
+          "TestPageEncoding",
+          "TestPageEncoding.test_out_of_range_rejected",
+          "TestPageEncoding.test_roundtrip_and_high_bits",
+          "TestRowIsolation",
+          "TestRowIsolation.test_begin_step_drops_row_when_pool_short",
+          "TestRowIsolation.test_unparticipating_row_untouched",
+          "TestSeedAndAlloc",
+          "TestSeedAndAlloc.test_pool_exhausted_returns_false",
+          "TestSeedAndAlloc.test_reset_returns_all_pages",
+          "TestSeedAndAlloc.test_seed_allocates_ceil_pages",
+          "TestWriteAndRead",
+          "TestWriteAndRead.test_ctx_and_block_land_at_logical_positions",
+          "TestWriteAndRead.test_pad_rows_are_not_written",
+          "TestWriteAndRead.test_rows_isolated",
+          "_cache",
+          "_kv"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_zos_accept.py",
+      "status": "added",
+      "loc_delta": 81,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestAcceptGreedyDevice",
+          "TestAcceptGreedyDevice.test_all_accepted_takes_bonus",
+          "TestAcceptGreedyDevice.test_exhaustive_binary",
+          "TestAcceptGreedyDevice.test_first_rejected",
+          "TestAcceptGreedyDevice.test_middle_rejected",
+          "TestAcceptGreedyDevice.test_random_larger_k",
+          "TestAcceptGreedyDevice.test_shape_validation",
+          "_compare"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_zos_advance.py",
+      "status": "added",
+      "loc_delta": 169,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestAdvanceReference",
+          "TestAdvanceReference.test_bs_smaller_than_capacity",
+          "TestAdvanceReference.test_cross_page_reads_new_page",
+          "TestAdvanceReference.test_negative_advance_is_not_allowed_in_practice",
+          "TestAdvanceReference.test_three_steps_match_cpu_rebuild",
+          "TestAdvanceReference.test_variable_advance_per_row",
+          "TestAdvanceReference.test_verify_cu_seqlens_is_cumulative",
+          "TestAdvanceReference.test_verify_metadata_from_device_starts",
+          "_state",
+          "_step"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_zos_fallback.py",
+      "status": "added",
+      "loc_delta": 82,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestStepSyncReuse",
+          "TestStepSyncReuse.test_reuses_given_batch_without_rescheduling",
+          "TestStepSyncReuse.test_schedules_when_no_batch_given",
+          "_CountingScheduler",
+          "_CountingScheduler.__init__",
+          "_CountingScheduler.is_finished",
+          "_CountingScheduler.schedule",
+          "_CountingScheduler.update",
+          "_core"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/README.md",
+      "status": "removed",
+      "loc_delta": -403,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/demo.py",
+      "status": "removed",
+      "loc_delta": -119,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [
+          "main",
+          "sync"
+        ],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/phase_summary.py",
+      "status": "removed",
+      "loc_delta": -63,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [
+          "main"
+        ],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/profile.sh",
+      "status": "removed",
+      "loc_delta": -33,
+      "language": "shell",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/profile_vllm.py",
+      "status": "removed",
+      "loc_delta": -206,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [
+          "main"
+        ],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/rss_probe.py",
+      "status": "removed",
+      "loc_delta": -135,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [
+          "main",
+          "rss"
+        ],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/vllm_b4_kern_by_nvtx.txt",
+      "status": "removed",
+      "loc_delta": -76,
+      "language": "text",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/vllm_b4_phase_summary.txt",
+      "status": "removed",
+      "loc_delta": -46,
+      "language": "text",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "nsys-demo/vllm_b4_stats.txt",
+      "status": "removed",
+      "loc_delta": -129,
+      "language": "text",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "bench/README.md",
+      "status": "modified",
+      "loc_delta": 15,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "bench-docs-runner"
+      ]
+    },
+    {
+      "path": "bench/spec_bench.py",
+      "status": "modified",
+      "loc_delta": 26,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": [
+          "_run_one"
+        ]
+      },
+      "nodes": [
+        "bench-spec-decode"
+      ]
+    },
+    {
+      "path": "docs/README.md",
+      "status": "modified",
+      "loc_delta": 2,
+      "language": "markdown",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "docs-index"
+      ]
+    },
+    {
+      "path": "run.py",
+      "status": "modified",
+      "loc_delta": 18,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "entry.single-node"
+      ]
+    },
+    {
+      "path": "src/compute/batch.py",
+      "status": "modified",
+      "loc_delta": 18,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "Batch.bind_verify"
+        ],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "compute.batch"
+      ]
+    },
+    {
+      "path": "src/compute/model_runner.py",
+      "status": "modified",
+      "loc_delta": 327,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "ModelRunner._verify_zos",
+          "ModelRunner.discard_pending",
+          "ModelRunner.run_decode_advance",
+          "ModelRunner.sync_samples"
+        ],
+        "removed": [],
+        "changed": [
+          "ModelRunner._run_decode",
+          "ModelRunner._run_verify"
+        ]
+      },
+      "nodes": [
+        "compute.model-runner"
+      ]
+    },
+    {
+      "path": "src/compute/worker.py",
+      "status": "modified",
+      "loc_delta": 28,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "Worker.discard_pending",
+          "Worker.execute_model_advance",
+          "Worker.last_accept",
+          "Worker.last_decode_dev",
+          "Worker.sync_samples"
+        ],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "compute.worker"
+      ]
+    },
+    {
+      "path": "src/config.py",
+      "status": "modified",
+      "loc_delta": 32,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "EngineConfig.zos_enabled"
+        ],
+        "removed": [],
+        "changed": []
+      },
+      "nodes": [
+        "src.config"
+      ]
+    },
+    {
+      "path": "src/control/core.py",
+      "status": "modified",
+      "loc_delta": 19,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "EngineCore._step_sync"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/control/engine.py",
+      "status": "modified",
+      "loc_delta": 10,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "Engine.zos_stats"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/control/executor.py",
+      "status": "modified",
+      "loc_delta": 43,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "Executor.discard_pending",
+          "Executor.last_accept",
+          "Executor.last_decode_dev",
+          "Executor.run_decode_advance",
+          "Executor.sync_samples",
+          "UniprocExecutor.discard_pending",
+          "UniprocExecutor.last_accept",
+          "UniprocExecutor.last_decode_dev",
+          "UniprocExecutor.run_decode_advance",
+          "UniprocExecutor.sync_samples"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/spec/dspark/drafter.py",
+      "status": "modified",
+      "loc_delta": 295,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "DSparkDrafter._ensure_cache",
+          "DSparkDrafter._ensure_paged",
+          "DSparkDrafter._propose_paged",
+          "DSparkDrafter.propose_batch_ids",
+          "DSparkDrafter.seed_padded_from_past",
+          "DSparkDrafter.take_pending",
+          "DSparkDrafter.update_full"
+        ],
+        "removed": [],
+        "changed": [
+          "DSparkDrafter.__init__"
+        ]
+      }
+    },
+    {
+      "path": "src/spec/dspark/modeling.py",
+      "status": "modified",
+      "loc_delta": 25,
+      "language": "python",
+      "symbols": {
+        "added": [],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "src/spec/dspark/padded_cache.py",
+      "status": "modified",
+      "loc_delta": 94,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "PaddedKVCache.seed_from_dynamic"
+        ],
+        "removed": [],
+        "changed": [
+          "PaddedKVCache.begin_step"
+        ]
+      }
+    },
+    {
+      "path": "src/spec/verify.py",
+      "status": "modified",
+      "loc_delta": 62,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "accept_greedy_device"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    },
+    {
+      "path": "tests/unit/test_dspark_drafter_batch.py",
+      "status": "modified",
+      "loc_delta": 100,
+      "language": "python",
+      "symbols": {
+        "added": [
+          "TestBatchEquivalence.test_tensor_entry_matches_int_entry",
+          "TestPagedEquivalence",
+          "TestPagedEquivalence._pair",
+          "TestPagedEquivalence.test_pool_exhaustion_degrades_to_no_draft",
+          "TestPagedEquivalence.test_single_sequence_two_steps",
+          "TestPagedEquivalence.test_two_sequences_isolated"
+        ],
+        "removed": [],
+        "changed": []
+      }
+    }
+  ],
+  "node_changes": [
+    {
+      "id": "compute.batch",
+      "label": "Batch 输入缓冲",
+      "status": "modified",
+      "files": [
+        "src/compute/batch.py"
+      ],
+      "reasons": [
+        "src/compute/batch.py 修改：新增 Batch.bind_verify"
+      ]
+    },
+    {
+      "id": "compute.model-runner",
+      "label": "ModelRunner 推理主循环",
+      "status": "modified",
+      "files": [
+        "src/compute/model_runner.py"
+      ],
+      "reasons": [
+        "src/compute/model_runner.py 修改：新增 ModelRunner._verify_zos、ModelRunner.discard_pending、ModelRunner.run_decode_advance；签名变化 ModelRunner._run_decode、ModelRunner._run_verify"
+      ]
+    },
+    {
+      "id": "compute.worker",
+      "label": "Worker 执行入口",
+      "status": "modified",
+      "files": [
+        "src/compute/worker.py"
+      ],
+      "reasons": [
+        "src/compute/worker.py 修改：新增 Worker.discard_pending、Worker.execute_model_advance、Worker.last_accept"
+      ]
+    },
+    {
+      "id": "bench-docs-runner",
+      "label": "bench 文档与矩阵运行脚本",
+      "status": "modified",
+      "files": [
+        "bench/README.md"
+      ],
+      "reasons": [
+        "bench/README.md 修改"
+      ]
+    },
+    {
+      "id": "entry.single-node",
+      "label": "单机推理入口 run.py",
+      "status": "modified",
+      "files": [
+        "run.py"
+      ],
+      "reasons": [
+        "run.py 修改"
+      ]
+    },
+    {
+      "id": "src.config",
+      "label": "引擎配置 EngineConfig",
+      "status": "modified",
+      "files": [
+        "src/config.py"
+      ],
+      "reasons": [
+        "src/config.py 修改：新增 EngineConfig.zos_enabled"
+      ]
+    },
+    {
+      "id": "bench-spec-decode",
+      "label": "投机解码基准 spec_bench.py",
+      "status": "modified",
+      "files": [
+        "bench/spec_bench.py"
+      ],
+      "reasons": [
+        "bench/spec_bench.py 修改：签名变化 _run_one"
+      ]
+    },
+    {
+      "id": "docs-index",
+      "label": "文档索引（docs/README）",
+      "status": "modified",
+      "files": [
+        "docs/README.md"
+      ],
+      "reasons": [
+        "docs/README.md 修改"
+      ]
+    }
+  ],
+  "impacted": [
+    {
+      "id": "compute.package",
+      "label": "compute 包导出面",
+      "distance": 1,
+      "via": "compute.model-runner",
+      "via_label": "ModelRunner 推理主循环",
+      "kind": "owns"
+    },
+    {
+      "id": "src.package-init",
+      "label": "src 包公开入口",
+      "distance": 1,
+      "via": "src.config",
+      "via_label": "引擎配置 EngineConfig",
+      "kind": "flows_to"
+    }
+  ],
+  "containers": [],
+  "placeholders": [
+    {
+      "id": "new:bench/zos_bench.py",
+      "label": "zos_bench.py",
+      "path": "bench/zos_bench.py",
+      "status": "added",
+      "loc": 265,
+      "language": "python"
+    },
+    {
+      "id": "new:docs/draft-kv-paged-plan.md",
+      "label": "draft-kv-paged-plan.md",
+      "path": "docs/draft-kv-paged-plan.md",
+      "status": "added",
+      "loc": 116,
+      "language": "markdown"
+    },
+    {
+      "id": "new:docs/zos-report.md",
+      "label": "zos-report.md",
+      "path": "docs/zos-report.md",
+      "status": "added",
+      "loc": 315,
+      "language": "markdown"
+    },
+    {
+      "id": "new:docs/zos-spec-plan.md",
+      "label": "zos-spec-plan.md",
+      "path": "docs/zos-spec-plan.md",
+      "status": "added",
+      "loc": 137,
+      "language": "markdown"
+    },
+    {
+      "id": "new:src/compute/decode_inputs.py",
+      "label": "decode_inputs.py",
+      "path": "src/compute/decode_inputs.py",
+      "status": "added",
+      "loc": 264,
+      "language": "python",
+      "node_id": "decode_inputs"
+    },
+    {
+      "id": "new:src/control/async_decode.py",
+      "label": "async_decode.py",
+      "path": "src/control/async_decode.py",
+      "status": "added",
+      "loc": 331,
+      "language": "python",
+      "node_id": "async_decode"
+    },
+    {
+      "id": "new:src/spec/dspark/paged_cache.py",
+      "label": "paged_cache.py",
+      "path": "src/spec/dspark/paged_cache.py",
+      "status": "added",
+      "loc": 503,
+      "language": "python",
+      "node_id": "paged_cache"
+    },
+    {
+      "id": "new:tests/gpu/test_dspark_paged_gpu.py",
+      "label": "test_dspark_paged_gpu.py",
+      "path": "tests/gpu/test_dspark_paged_gpu.py",
+      "status": "added",
+      "loc": 89,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/gpu/test_zos_e2e.py",
+      "label": "test_zos_e2e.py",
+      "path": "tests/gpu/test_zos_e2e.py",
+      "status": "added",
+      "loc": 55,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/unit/test_dspark_padded_cache_zos.py",
+      "label": "test_dspark_padded_cache_zos.py",
+      "path": "tests/unit/test_dspark_padded_cache_zos.py",
+      "status": "added",
+      "loc": 106,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/unit/test_dspark_paged_cache.py",
+      "label": "test_dspark_paged_cache.py",
+      "path": "tests/unit/test_dspark_paged_cache.py",
+      "status": "added",
+      "loc": 197,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/unit/test_zos_accept.py",
+      "label": "test_zos_accept.py",
+      "path": "tests/unit/test_zos_accept.py",
+      "status": "added",
+      "loc": 81,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/unit/test_zos_advance.py",
+      "label": "test_zos_advance.py",
+      "path": "tests/unit/test_zos_advance.py",
+      "status": "added",
+      "loc": 169,
+      "language": "python"
+    },
+    {
+      "id": "new:tests/unit/test_zos_fallback.py",
+      "label": "test_zos_fallback.py",
+      "path": "tests/unit/test_zos_fallback.py",
+      "status": "added",
+      "loc": 82,
+      "language": "python"
+    }
+  ],
+  "unmapped": [
+    "nsys-demo/README.md",
+    "nsys-demo/demo.py",
+    "nsys-demo/phase_summary.py",
+    "nsys-demo/profile.sh",
+    "nsys-demo/profile_vllm.py",
+    "nsys-demo/rss_probe.py",
+    "nsys-demo/vllm_b4_kern_by_nvtx.txt",
+    "nsys-demo/vllm_b4_phase_summary.txt",
+    "nsys-demo/vllm_b4_stats.txt",
+    "src/control/core.py",
+    "src/control/engine.py",
+    "src/control/executor.py",
+    "src/spec/dspark/drafter.py",
+    "src/spec/dspark/modeling.py",
+    "src/spec/dspark/padded_cache.py",
+    "src/spec/verify.py",
+    "tests/unit/test_dspark_drafter_batch.py"
+  ],
+  "abandoned": [],
+  "notes": {
+    "title": "ZOS 调度与草稿 KV 页式化",
+    "intent": "把「调度与计算重叠」（ZOS）落到本引擎，并把草稿 KV 从按行预留改为页池，为长上下文与多卡扩展留接口。",
+    "nodes": [
+      {
+        "id": "compute.model-runner",
+        "label": "ModelRunner 主前向循环",
+        "summary": "decode/verify 的实际执行者；现同时承载普通 decode、DSpark 投机、ZOS 设备侧推进三条路径。",
+        "change": "新增 _run_decode(device_advance=...) / run_decode_advance：ZOS 下不再重建输入，改由 advance_decode 在常驻缓冲上推进；采样回读改成双缓冲 + FIFO 提交/消费分离；_run_verify 去掉单序列假设（按 cu_seqlens 拼平、逐序列落账）；新增 _verify_zos（设备侧元数据 + 整批裁决）。",
+        "pitfalls": [
+          "回落时不能重新 schedule()：控制器已排过一次，再排会把刚落地的 prefill 当 decode 行（实测 AssertionError len(token_ids)=30 vs 1）",
+          "ahead 批里必须放真实 Sequence（ScheduledBatch 装的是 Sequence，不是 SeqSchedule），否则 to_wire 断言失败且 _can_lookahead 的身份比较永远为真 → ZOS 永不生效",
+          "spec 一拍产出 1+j 个 token（d_ids 扁平），结束判断要按每行全部产出，用 num_completion+1 会漏 fence",
+          "长上下文下草稿 _zos_ub 只增不减，会一路退回 eager（每 32 拍 drain 重锚）",
+          "页式草稿下 device_segs 被 fail loud 拒绝：读路径一仍需要 host 侧 seg_max"
+        ]
+      },
+      {
+        "id": "compute.batch",
+        "label": "Batch 输入缓冲",
+        "summary": "常驻的 decode/prefill 输入缓冲与 H2D 打包。",
+        "change": "新增 bind_verify(bs, m)：只写常量 cu_seqlens_q、不重绑视图、不做 H2D —— verify 的元数据在 ZOS 下由设备侧 advance_verify 写。",
+        "pitfalls": [
+          "这里是常驻缓冲，没有 _input_views/_inputs（那是另一个项目的设计）；抄错会 AttributeError"
+        ]
+      },
+      {
+        "id": "compute.worker",
+        "label": "Worker 执行封装",
+        "summary": "单卡内的执行入口，向上提供 run/read_samples。",
+        "change": "新增 execute_model_advance / last_decode_dev / last_accept / sync_samples / discard_pending，用于 ZOS 的提前提交与在途结果回收。",
+        "pitfalls": [
+          "discard_pending 必须与 sync_samples 成对调用，否则过期回读条目会被下一次 read_samples 弹出"
+        ]
+      },
+      {
+        "id": "bench-docs-runner",
+        "label": "bench 文档与运行脚本",
+        "change": "新增 zos_bench（开/关对照，报 decode 步时分位数 + 逐 token 一致 + 流水线计数）；spec_bench 增加 --max-num-seqs / --spec-draft-batch / --spec-draft-paged 等开关。",
+        "summary": "性能与一致性的统一入口。"
+      }
+    ],
+    "new_nodes": [
+      {
+        "path": "src/control/async_decode.py",
+        "label": "ZOS 控制器",
+        "summary": "把下一拍提交提前到上一拍结果处理之前：submit（只发射 + 异步 D2H）/ consume（唯一同步点）/ plan_lookahead（四个 drain + 两个 fence）。",
+        "pitfalls": [
+          "只处理纯 greedy decode 批；prefill、批次变化、行序变化一律 drain 回同步路径",
+          "EOS 与 radix 换页必须 fence（先等在途那拍），否则 update 释放的页会被在途计算写入"
+        ]
+      },
+      {
+        "path": "src/compute/decode_inputs.py",
+        "label": "设备侧输入推进",
+        "summary": "advance_decode（每行推进 1 或 1+j，写 input_ids/positions/slot_mapping/cache_seqlens）与 advance_verify（按设备 starts 写 verify 的 [bs,m] 元数据 + cu_seqlens_k 前缀和）。",
+        "pitfalls": [
+          "advances 必须每行独立（投机时 1+j 逐行不同）",
+          "跨页时必须读新页；cu_seqlens_k 必须是前缀和而非每行独立值"
+        ]
+      },
+      {
+        "path": "src/spec/dspark/paged_cache.py",
+        "label": "页式草稿 KV",
+        "summary": "页池 + 页表替代按行预留：容量 O(实际 token)，页号 int64 高位留 tier/device。读路径一 gather 成稠密走现有 SDPA（vendored attention 零改动）；读路径二走 flash_attn_with_kvcache(block_table=)。",
+        "pitfalls": [
+          "kv_len 是批内共享标量（max(lens)+seg_max+block），分配必须按 seg_max 否则短行读不到共享长度",
+          "crop 必须退还尾部整页，只做逻辑缩短会让页数按 m 增长（1.33x 浪费照旧）",
+          "页表写错会读到别的序列的数据且不报错；未参与本步的行绝不能被推进",
+          "读路径二要求页大小为 256 的倍数（本仓 config 同样硬校验），且尚未在 GPU 验证"
+        ]
+      }
+    ]
+  },
+  "applied": {
+    "nodes_updated": 4,
+    "nodes_created": 3,
+    "edges_added": 0,
+    "warnings": []
+  }
+}
