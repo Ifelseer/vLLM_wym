@@ -73,6 +73,8 @@ def _run_one(
     draft_page_size: int = 16,
     draft_paged_pages: int = 0,
     draft_paged_fa: bool = False,
+    zos_spec: bool = False,
+    enable_zos: bool = True,
     max_num_seqs: int = 1,
 ) -> dict:
     import torch
@@ -100,6 +102,8 @@ def _run_one(
             spec_draft_page_size=draft_page_size,
             spec_draft_paged_pages=draft_paged_pages,
             spec_draft_paged_fa=draft_paged_fa,
+            enable_zos=enable_zos,
+            zos_spec=zos_spec,
         )
     )
     try:
@@ -232,6 +236,13 @@ def main() -> None:
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--devices", default="0")
+    p.add_argument(
+        "--zos-spec",
+        action="store_true",
+        help="投机也进 ZOS 流水线（方案 B）。8B b=1 实测 0.948x（负收益），"
+        "只在确认投机路径有大 gap 时才值得开",
+    )
+    p.add_argument("--no-zos", action="store_true", help="关掉 ZOS（含非投机路径）")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--quantization", default="none", choices=_QUANT_CHOICES)
     p.add_argument("--cg", action="store_true", help="启用 decode CUDA Graph")
@@ -283,6 +294,8 @@ def main() -> None:
         draft_page_size=args.spec_draft_page_size,
         draft_paged_pages=args.spec_draft_paged_pages,
         draft_paged_fa=args.spec_draft_paged_fa,
+        zos_spec=args.zos_spec,
+        enable_zos=not args.no_zos,
         max_num_seqs=args.max_num_seqs,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")

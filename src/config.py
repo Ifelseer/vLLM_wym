@@ -143,6 +143,11 @@ class EngineConfig:
     zos_device_accept: bool = True
     # 投机也进 ZOS 流水线（方案 B：草稿按 m 追加 + 设备侧有效位 + ub 上界选桶）。
     # 默认关：它依赖 verify 的设备侧元数据与整批设备裁决，需先通过 GPU 逐 token 对照。
+    # 投机也进 ZOS 流水线（方案 B：草稿按 m 追加 + 设备侧有效位 + ub 上界选桶）。
+    # 默认关：实测 8B b=1 为 0.948x（**负收益**，见 docs/zos-report.md §5.2）——
+    # 投机路径的 host 工作已被设备侧裁决与 verify 图压得很小，ZOS 可藏的部分接近零，
+    # 而它自己还要多付"设备侧元数据 + 草稿 KV 按 m 追加的 1.33x 余量"。
+    # 只有在你确实观察到投机路径存在大 gap（例如关掉 verify 图、或长上下文 eager）时才值得开。
     zos_spec: bool = False
 
     @property
@@ -188,6 +193,25 @@ class EngineConfig:
         if self.spec_tokens > 0:
             # 多序列已支持：verify 按 cu_seqlens 拼平一次前向，落账逐序列。
             # 已知代价：verify 图只在 bs==1 生效，bs>1 回退 eager。
+            # --- 投机 × ZOS 的组合护栏（方案 B）---
+            # 投机进 ZOS 的唯一数据通路是"设备侧接受裁决"：`_next_input` 要靠
+            # `_zos_next/_zos_adv` 喂下一拍，而它们只有在 `zos_device_accept` 打开时
+            # 才会被 `_verify_zos` 写入。关掉它会让第一次 lookahead 抛
+            # RuntimeError("spec decode without device-side accept")——
+            # 与其跑到半路崩，不如在构造期就说清。
+            if self.zos_spec and not self.zos_device_accept:
+                raise ValueError(
+                    "zos_spec 需要 zos_device_accept=True：投机的下一拍输入来自"
+                    "设备侧接受裁决，关掉它就没有 tokens/advances 可喂"
+                )
+            if self.zos_spec and not self.enable_zos:
+                raise ValueError("zos_spec=True 但 enable_zos=False：投机流水线不会生效")
+            if self.zos_spec and self.spec_draft != "dspark":
+                # ngram 的草稿数是逐拍变化的，m 不固定 → 无法按 m 追加
+                raise ValueError(
+                    "zos_spec 目前只支持 spec_draft='dspark'（ngram 的每拍草稿数不定，"
+                    "无法按固定 m 追加草稿 KV）"
+                )
             if self.spec_draft not in ("ngram", "dspark"):
                 raise ValueError(
                     f"spec_draft must be ngram|dspark, got {self.spec_draft!r}"

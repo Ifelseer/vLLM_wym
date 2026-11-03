@@ -1,9 +1,36 @@
 # 投机解码接入 ZOS（方案 B）设计
 
-> 状态：**设计已定，实现未开始**。前置已完成：`advance_decode`（普通 decode 的设备侧推进）、
-> `advance_verify`（verify 元数据）、`accept_greedy_device`（设备侧裁决）、
-> `propose_batch_ids`（草稿设备侧入参）、`_SpecSamples.dev_*`（样本异步回传）。
+> 状态：**已实现并上机验证（8B 上为负收益，故默认关）**。
 > 参考实现：DeepInfer `csrc/engine/zos.cpp`。
+>
+> 怎么打开（不改代码）：
+>
+> ```bash
+> PYTHONPATH=. python bench/spec_bench.py ... --zos-spec   # 或 run.py --zos-spec
+> # 关掉非投机 ZOS：--no-zos
+> ```
+>
+> 配置护栏（构造期 fail loud，见 `tests/unit/test_zos_spec_config.py`）：
+> `zos_spec` 要求 `zos_device_accept=True`（否则第一次 lookahead 就抛
+> "spec decode without device-side accept"）、要求 `enable_zos=True`、
+> 要求 `spec_draft="dspark"`（ngram 的草稿数逐拍变化，`m` 不固定）。
+>
+> 实测（8B fp8 + dspark k=7，b=1，n=128，transformers 5.10.2）：
+>
+> | 配置 | decode tok/s | 相对非 ZOS |
+> |---|---|---|
+> | spec（非 ZOS） | 332.6 | 1.000× |
+> | spec + ZOS（**eager** verify） | 148.5 | 0.446× |
+> | spec + ZOS（**ub + verify 图**） | **315.4** | **0.948×** |
+>
+> 正确性：`accept_len 6.000`、`accept_rate 71.43%`、逐位置曲线、128 个 token
+> 与非 ZOS **逐位一致**。从 eager 到图版提升 2.12×，全部来自"用 `ub` 上界把
+> verify 图保住"。
+>
+> **为什么仍然默认关**：投机路径的 host 工作已被设备侧裁决与 verify 图压到几十
+> 微秒，而 `G ≈ 18 ms`，可藏部分接近零；ZOS 还要额外付"设备侧元数据构造 +
+> 草稿 KV 按 `m` 追加的 1.33× 余量"。要让投机 ZOS 转正，前提是先有东西**增大 C**，
+> 而不是继续优化它的开销。
 
 ---
 
