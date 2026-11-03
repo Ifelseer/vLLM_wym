@@ -62,6 +62,9 @@ def _run(
             spec_draft_paged_pages=pages,
         )
     ) as eng:
+        # 进程级高水位必须**每次重置**：dense 先跑、paged 后跑，不 reset 的话
+        # 后者必然 ≥ 前者，任何 "<" 断言都会失败（bench 里同样在构造后 reset）。
+        torch.cuda.reset_peak_memory_stats()
         seqs = [
             eng.add_request(
                 _PROMPT, SamplingParams(temperature=0.0, max_tokens=n, ignore_eos=True)
@@ -101,11 +104,18 @@ def test_batch_mode_paged_uses_less_memory():
     """batch 模式：dense 走 PaddedKVCache（行数 × max_len），paged 按需分配。
 
     这是文档里「671 MB / 1.34 GB → O(实际 token)」的对照场景。
+
+    ⚠️ 必须**并发 ≥2 条**：`model_runner` 只在 `len(seqs) > 1` 时才走
+    `propose_batch`；单序列的 dense 仍走 `DynamicCache`（约 1.6 MB），
+    拿它当对照对象不成立（那条用例里 paged 的池反而更大）。
     """
-    _, _, dense_peak = _run(paged=False, draft_batch=True)
-    _, _, paged_peak = _run(paged=True, draft_batch=True, pages=256)
+    _, _, dense_peak = _run(paged=False, draft_batch=True, max_num_seqs=2)
+    _, _, paged_peak = _run(
+        paged=True, draft_batch=True, pages=256, max_num_seqs=2
+    )
     assert paged_peak < dense_peak, (
-        f"batch 模式下页式应更省：dense {dense_peak:.2f} GB vs paged {paged_peak:.2f} GB"
+        "batch 模式下页式应更省："
+        f"dense(PaddedKVCache) {dense_peak:.2f} GB vs paged {paged_peak:.2f} GB"
     )
 
 

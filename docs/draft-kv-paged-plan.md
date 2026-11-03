@@ -153,4 +153,8 @@ page_id (int64)
 
 - 引擎级 `n=128` 总长 158 < 页大小 256，**只覆盖单页**；跨页/多行只到 kernel 级；
 - **多行引擎路径（`max_num_seqs>1` + 页式）未跑**；
+- `test_batch_mode_paged_uses_less_memory`（batch 模式下 dense `PaddedKVCache` vs
+  paged 的显存对照）**尚未实测**。注意该用例必须并发 ≥2 条请求（单序列的 dense 仍走
+  `DynamicCache`，对照对象不成立），且每次 `_run` 都要 `reset_peak_memory_stats()`；
+  该用例只含 `torch.cuda` 分配，不含 `torch.cuda.empty_cache()`，分进程跑更稳；
 - 路径二的 `spec_draft_paged_fa` 仍需在长上下文机型上验证才可考虑设默认。
