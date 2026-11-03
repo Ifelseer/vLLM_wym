@@ -662,6 +662,7 @@ class ModelRunner:
                 use_paged=bool(self.config.spec_draft_paged),
                 page_size=int(self.config.spec_draft_page_size),
                 num_pages=int(self.config.spec_draft_paged_pages),
+                use_paged_fa=bool(self.config.spec_draft_paged_fa),
             )
         return self._dspark
 

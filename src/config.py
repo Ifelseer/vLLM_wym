@@ -130,6 +130,9 @@ class EngineConfig:
     spec_draft_page_size: int = 16
     #: 页池容量。0 表示按 `max(64, max_rows × 16)` 自动推导；不足时该序列本步不起草。
     spec_draft_paged_pages: int = 0
+    #: 页式读路径二（flash_attn_with_kvcache + block_table）。**默认关**：
+    #: 需要 GPU 实测，且要求 `spec_draft_page_size` 是 256 的倍数。
+    spec_draft_paged_fa: bool = False
 
     # --- ZOS（Zero-Overhead Scheduling）---
     # 让下一轮提交提前到上一轮结果处理之前：GPU 用自己上一轮的输出当输入，CPU 在后面

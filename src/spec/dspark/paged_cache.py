@@ -106,6 +106,7 @@ class PagedDraftKV:
         page_size: int = 16,
         device: torch.device | str = "cpu",
         dtype: torch.dtype = torch.float32,
+        use_fa: bool = False,
     ) -> None:
         if num_pages <= 0:
             raise ValueError(f"num_pages must be > 0, got {num_pages}")
@@ -119,6 +120,10 @@ class PagedDraftKV:
         self.page_size = int(page_size)
         self.device = torch.device(device)
         self.dtype = dtype
+        #: 读路径二开关（attention 侧据此改走 flash_attn_with_kvcache）。
+        #: ⚠️ 本仓库当前只在单卡 24G 上验证过路径一；路径二需要 GPU 实测，
+        #: 且页大小必须 256 的倍数（见 `fa_args`）。
+        self.is_paged_fa = bool(use_fa)
 
         # 页池：k/v 各 num_layers 张 [num_pages, page_size, heads, dim]，按层懒分配
         # （未用到的层不占显存，与稠密实现一致）。
@@ -350,6 +355,57 @@ class PagedDraftKV:
             flat_v[slots] = v[i, :, blk_src].transpose(0, 1)
 
         return self.read_dense_layer(layer_idx)
+
+    # ---------------------------------------------------------------- #
+    # 读路径二：交给 flash-attn 的 paged kernel（默认关）
+    # ---------------------------------------------------------------- #
+
+    def update_paged(self, k: torch.Tensor, v: torch.Tensor, layer_idx: int) -> None:
+        """只写页池、不 gather（读路径二用）。写入语义与 `update` 完全一致。"""
+        pool_k, pool_v = self._pool(layer_idx)
+        flat_k = pool_k.view(-1, self.num_kv_heads, self.head_dim)
+        flat_v = pool_v.view(-1, self.num_kv_heads, self.head_dim)
+        n = len(self._rows)
+        assert k.shape[0] == n, f"k batch {k.shape[0]} != 参与行数 {n}"
+        for i, r in enumerate(self._rows):
+            seg = self._segs[i]
+            start = self._lens_host[r] + seg
+            if seg > 0:
+                src = torch.arange(seg, device=self.device)
+                dst = torch.arange(self._lens_host[r], start, device=self.device)
+                slots = self._slots(r, dst)
+                flat_k[slots] = k[i, :, src].transpose(0, 1)
+                flat_v[slots] = v[i, :, src].transpose(0, 1)
+            blk_src = torch.arange(
+                self._seg_max, self._seg_max + self._block, device=self.device
+            )
+            blk_dst = torch.arange(start, start + self._block, device=self.device)
+            slots = self._slots(r, blk_dst)
+            flat_k[slots] = k[i, :, blk_src].transpose(0, 1)
+            flat_v[slots] = v[i, :, blk_src].transpose(0, 1)
+
+    def fa_args(self, layer_idx: int) -> tuple:
+        """返回 ``(k_cache, v_cache, cache_seqlens, block_table)`` 供
+        ``flash_attn_with_kvcache(..., block_table=...)`` 使用。
+
+        约束（已核实本仓 `config.py` 对目标模型有同样校验）：**页大小必须是 256 的
+        倍数**，否则 FA2 的 paged kernel 不匹配。这里 fail loud 而不是静默降级。
+
+        注意：本方法依赖 `paged_cache` 的页池布局恰好等于 FA 期望的
+        ``[num_blocks, page_block_size, nheads_k, headdim]``。
+        """
+        if self.page_size % 256 != 0:
+            raise ValueError(
+                f"flash-attn paged 要求页大小为 256 的倍数，当前 {self.page_size}；"
+                "请设 spec_draft_page_size=256 或关闭 spec_draft_paged_fa"
+            )
+        pool_k, pool_v = self._pool(layer_idx)
+        seqlens = torch.tensor(
+            [self._lens_host[r] + self._segs[i] + self._block for i, r in enumerate(self._rows)],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return pool_k, pool_v, seqlens, self.block_table().to(torch.int32)
 
     def read_dense_layer(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
         """单层 gather：``[B, heads, kv_len, dim]``。"""

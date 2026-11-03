@@ -134,6 +134,31 @@ class Qwen3DSparkAttention(nn.Module):
         v = v.transpose(1, 2)
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+        if past_key_values is not None and getattr(
+            past_key_values, "is_paged_fa", False
+        ):
+            # 读路径二（页式 + flash-attn paged kernel）：写入页池后直接让 kernel
+            # 按页表读，不物化稠密 K/V。页大小必须 256 的倍数（`fa_args` 里校验）。
+            # ⚠️ 该分支**尚未在 GPU 上验证**，默认关（spec_draft_paged_fa）。
+            from flash_attn import flash_attn_with_kvcache
+
+            past_key_values.update_paged(k, v, self.layer_idx)
+            k_cache, v_cache, seqlens, block_table = past_key_values.fa_args(
+                self.layer_idx
+            )
+            attn_out = flash_attn_with_kvcache(
+                q.transpose(1, 2),
+                k_cache,
+                v_cache,
+                cache_seqlens=seqlens,
+                block_table=block_table,
+                causal=False,
+            )
+            attn_out = attn_out.reshape(
+                bsz, q_len, self.num_attention_heads * self.head_dim
+            )
+            return attn_out, None
+
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             k, v = past_key_values.update(k, v, self.layer_idx, cache_kwargs)

@@ -60,6 +60,7 @@ class DSparkDrafter:
         use_paged: bool = False,
         page_size: int = 16,
         num_pages: int = 0,
+        use_paged_fa: bool = False,
     ) -> None:
         self.model = model
         self.device = device
@@ -84,6 +85,8 @@ class DSparkDrafter:
         self.use_paged = bool(use_paged)
         self.page_size = int(page_size)
         self.num_pages = int(num_pages)
+        #: 读路径二（FA paged）；未开页式时无意义
+        self.use_paged_fa = bool(use_paged_fa) and self.use_paged
         self._paged: PagedDraftKV | None = None
 
     # ---------------------------------------------------------------- #
@@ -276,7 +279,12 @@ class DSparkDrafter:
         if len(cache.active_rows) != 1:
             # 页池不足：本步不起草（只损收益，不影响正确性）
             return [], None
-        mask = cache.mask(q_len=block)
+        # 读路径二不需要 additive mask（FA 按 cache_seqlens 处理变长）
+        mask = (
+            None
+            if getattr(cache, "is_paged_fa", False)
+            else cache.mask(q_len=block)
+        )
         hidden = self.model._forward_backbone(
             position_ids=positions,
             noise_embedding=self.model.embed_tokens(ids),
@@ -352,6 +360,7 @@ class DSparkDrafter:
                 page_size=self.page_size,
                 device=self.device,
                 dtype=next(self.model.parameters()).dtype,
+                use_fa=self.use_paged_fa,
             )
         return self._paged
 
@@ -612,8 +621,13 @@ class DSparkDrafter:
                 self.propose(sid, anchor_token_id=a, start=st, first_ctx=fc)
                 for sid, a, st, fc in items
             ]
-        # q 只有 block 个（块内非因果），kv 才是 seg_max+block —— 掩码按 q 长度给
-        mask = cache.mask(q_len=block)
+        # q 只有 block 个（块内非因果），kv 才是 seg_max+block —— 掩码按 q 长度给。
+        # 读路径二不需要它（FA 用 cache_seqlens 处理变长）。
+        mask = (
+            None
+            if getattr(cache, "is_paged_fa", False)
+            else cache.mask(q_len=block)
+        )
         hidden = self.model._forward_backbone(
             position_ids=torch.stack(pos_rows),
             noise_embedding=self.model.embed_tokens(ids),
