@@ -124,6 +124,51 @@ class TestWriteAndRead:
         assert torch.all(dk[1] == 2.0)
 
 
+class TestBatchWideReservation:
+    """GPU 验收暴露的两类问题：多行不等长、页空回滚。"""
+
+    def test_short_row_covers_batch_kv_len(self):
+        """短行必须按**批内** `kv_len` 预页，否则 gather 越界（曾是断言失败）。"""
+        c = _cache(pages=16)
+        c.seed_row(1, 8)                     # 行 1 已有 8 个位置，行 0 还是 0
+        kv_len = c.begin_step([0, 1], [2, 2], seg_max=2, block=1)
+        assert kv_len == 8 + 2 + 1           # 批内共享上界
+        Need = c._pages_for(kv_len)
+        for r in (0, 1):
+            assert int((c.table[r] >= 0).sum()) >= Need, (
+                f"行 {r} 只分配了部分页，gather 会越界"
+            )
+        # 真跑一次写+读：修复前这里会在 _slots 断言
+        k = _kv(2, 3, base=0.0)
+        dk, _ = c.update(k, k, 0)
+        assert dk.shape == (2, HEADS, kv_len, DIM)
+
+    def test_failed_row_rolls_back_pages(self):
+        """页池不足时，该行本轮已分配的页必须退回（否则长跑泄漏）。"""
+        c = _cache(pages=3)                  # 只够 3 页
+        kv_len = c.begin_step([0, 1], [6, 6], seg_max=6, block=1)
+        assert kv_len == 7                   # ceil(7/4)=2 页/行
+        assert len(c.active_rows) == 1, "第二行应被剔除"
+        assert c.num_free == 1, "行 0 用 2 页，行 1 回滚后应剩 1 页"
+        assert int((c.table[1] >= 0).sum()) == 0, "失败行不许留下页"
+
+    def test_block_table_subset_matches_rows(self):
+        """FA 要求 block_table 的 batch 维与 q 对齐（曾是 shape 报错）。"""
+        c = _cache(pages=16)
+        c.begin_step([0, 1], [2, 2], seg_max=2, block=1)
+        assert c.block_table().shape[0] == 2
+        c.begin_step([1], [2], seg_max=2, block=1)
+        assert c.block_table().shape[0] == 1, "只传参与行"
+        assert c.block_table(subset=False).shape[0] == c.num_rows
+
+    def test_page_table_wide_enough_for_one_row(self):
+        """一行占满整个页池时不能 IndexError（页表宽度按 num_pages）。"""
+        c = _cache(rows=2, pages=8)
+        c.seed_row(0, 8 * PAGE)              # 行 0 独占 8 页
+        assert int((c.table[0] >= 0).sum()) == 8
+        assert c.num_free == 0
+
+
 class TestMask:
     def test_pad_region_masked(self):
         """矩形读会带出短行的 pad 区，掩码必须把 `[lens+seg+block, kv_len)` 遮掉。"""

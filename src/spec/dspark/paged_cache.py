@@ -131,7 +131,10 @@ class PagedDraftKV:
         self.v: list[torch.Tensor | None] = [None] * self.num_layers
 
         # 页表：每行逻辑页 → 物理页号（int64，高 8 位留 tier/device）
-        max_pages_per_row = max(1, (num_pages + self.num_rows - 1) // self.num_rows * 4)
+        # 页表宽度按**最坏情况**取：一行可能占满整个页池。人均份额会让长序列
+        # 在 `table[r, have] = ...` 上 IndexError（而不是优雅降级）。
+        # 代价是 num_rows × num_pages × 8B（8×512×8 = 32KB），可忽略。
+        max_pages_per_row = max(1, num_pages)
         self.table = torch.full(
             (self.num_rows, max_pages_per_row), -1, dtype=torch.int64, device=self.device
         )
@@ -258,15 +261,20 @@ class PagedDraftKV:
             rows = self._rows
         if seg_rows is None:
             seg_rows = self._segs
+        # 不变量：**每行已分配的页必须覆盖批内共享的 `_kv_len`**。
+        # 因为 gather 是矩形读（`max(lens) + seg_max + block`），短行若只按自己的
+        # `lens + seg` 预留，`_slots` 就会越界断言（多行不等长时必现）。
+        kv_len = (
+            (max(self._lens_host[r] for r in rows) + int(seg_max) + int(block))
+            if rows
+            else 0
+        )
+        need = self._pages_for(kv_len)
         kept_rows: list[int] = []
         kept_segs: list[int] = []
         for r, seg in zip(rows, seg_rows):
-            # 按 **seg_max** 预留：路径一要一次 gather 出矩形 `[B, kv_len, ...]`，
-            # 而 kv_len 是批内共享标量（max(lens)+seg_max+block）。短行多出来的
-            # pad 位置由 `mask()` 遮掉，crop 时这些页会被退还，所以不累积。
-            want = self._lens_host[r] + int(seg_max) + int(block)
-            need = self._pages_for(want)
-            have = int((self.table[r] >= 0).sum())
+            before = int((self.table[r] >= 0).sum())
+            have = before
             ok = True
             for _ in range(max(0, need - have)):
                 page = self._alloc_page()
@@ -276,7 +284,9 @@ class PagedDraftKV:
                 self.table[r, have] = encode_page(page)
                 have += 1
             if not ok:
-                # 页池空：该行本步不起草（只损收益，不影响正确性）
+                # 回滚本次已给该行加的页：否则它们既不在 `lens` 里、也不会被
+                # `crop` 退还 → 长跑逐渐泄漏。
+                self._release_row_pages(r, keep=before)
                 continue
             kept_rows.append(r)
             kept_segs.append(int(seg))
@@ -284,11 +294,9 @@ class PagedDraftKV:
         self._segs = kept_segs
         self._seg_max = int(seg_max)
         self._block = int(block)
-        self._kv_len = (
-            (max(self._lens_host[r] for r in kept_rows) + seg_max + block)
-            if kept_rows
-            else 0
-        )
+        # 有意不因剔除行而下调：多读的 pad 页会被 mask 遮掉、crop 时退还，
+        # 而缩小上界反而会让已分配页与新上界不自洽。
+        self._kv_len = kv_len if kept_rows else 0
         return self._kv_len
 
     def _pool(self, layer_idx: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -455,12 +463,17 @@ class PagedDraftKV:
     # 兼容旧接口（drafter 接线用）
     # ---------------------------------------------------------------- #
 
-    def block_table(self) -> torch.Tensor:
-        """``[num_rows, max_pages]`` int64，行内按逻辑页序（路径二用）。"""
-        max_used = max(
-            (int((self.table[r] >= 0).sum()) for r in range(self.num_rows)), default=0
-        )
-        return self.table[:, : max(1, max_used)]
+    def block_table(self, *, subset: bool = True) -> torch.Tensor:
+        """页表视图（行内按逻辑页序）。
+
+        ``subset=True``（默认）只返回**本步参与的行**：FA 要求 ``block_table`` 的
+        batch 维与 q 对齐，把整张 ``[num_rows, ...]`` 交过去会直接报
+        ``block_table must have shape (batch_size, max_num_blocks_per_seq)``。
+        列宽只在本步参与行上取 max —— 避免为一个已被剔除的长行开出过宽页表。
+        """
+        rows = self._rows if (subset and self._rows) else list(range(self.num_rows))
+        max_used = max((int((self.table[r] >= 0).sum()) for r in rows), default=0)
+        return self.table[rows, : max(1, max_used)]
 
     def seed_from_dynamic(self, row: int, past) -> int:
         """把单序列 ``DynamicCache`` 的 K/V 搬进本行（ZOS 切换用）。"""

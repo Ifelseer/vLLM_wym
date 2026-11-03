@@ -21,6 +21,13 @@
 
 单 token KV：草稿 `2 × 8 头 × 128 × 2B × 5 层 = 20 KiB`；目标（36 层）`144 KiB`。
 
+> **对照对象必须说清**（GPU 验收时踩到的口径问题）：
+> - 上面的 671 MB / 1.34 GB 是 **`PaddedKVCache`（`spec_draft_batch=True` / ZOS 路径）**；
+> - **单序列**（`max_num_seqs=1`，未开 batch 草稿）的 dense 走 `DynamicCache`，
+>   128 token 只有约 **1.6 MB**，比页池（默认 128 页 × 16 = 2048 token ≈42 MB）还小；
+> - 所以"页式更省"只在**长上下文 / 多序列 / batch 草稿**下成立，
+>   单序列短上下文用页式反而更占显存（池是上界，不是实际用量）。
+
 ## 2. 两条读路径（收益来自存储，不来自读路径）
 
 | 档 | 做法 | 代价 | 状态 |
@@ -114,3 +121,36 @@ page_id (int64)
 2. 若显存收益确认，把 `max_ctx_len` 从 4096 改为跟随 `context_len`（纯参数，不改结构）；
 3. 路径二在长上下文机型上验证后，才考虑把 `spec_draft_paged` 设为默认；
 4. 将来接 offload / CP 时，只需扩 `tier`/`device` 两段的填值逻辑与一个"页缺失换入"的钩子。
+
+---
+
+## 10. GPU 验收记录（2026-11-03，4090 24G，5.10.2，8B fp8 + dspark k=7）
+
+### 通过项
+
+| 用例 | 结果 |
+|---|---|
+| 路径一（gather → SDPA）vs 稠密 | **48/48 token 逐位相同**、accepted 32=32、steps/proposed 一致 |
+| 页池耗尽（pages=4，容量 64 token） | 允许中途不起草，输出与稠密前 32 位逐位一致 |
+| 路径二（FA paged）vs 路径一（n=128） | 两者都是 30 steps / 210 proposed / 98 accepted / **accept_len 4.2667**，差 0.0；128 token 逐位相同 |
+| FA kernel vs SDPA（隔离） | 单行 37 token、双行跨页（600/300，页号非连续）`max|diff| ≈ 0.002–0.004` |
+
+### 验收中暴露并已修的 7 处
+
+| # | 问题 | 症状 | 修法 |
+|---|---|---|---|
+| 1 | FA 分支自己 reshape + return，**漏 `o_proj`** | `accept_len 1.114 (13/798)`；输出 token 仍正确（verify 不看草稿质量）→ **静默** | 抽 `_project_out()` 作唯一出口，两条路径共用 |
+| 2 | `begin_step` 短行按自身 `lens+seg_max` 预页，gather 用批内 `max(lens)` | 多行不等长时 `_slots` 断言「页表不足」 | 先算批内 `kv_len`，所有行按它预页 |
+| 3 | `fa_args` 交整张 `[num_rows, ...]` 页表 | 首次运行 `RuntimeError: block_table must have shape (batch_size, max_num_blocks_per_seq)` | `block_table(subset=True)` 只取参与行 |
+| 4 | 页表宽度按"人均份额 ×4" | 单行占满页池时 `IndexError`（而非优雅降级） | 宽度取 `num_pages`（最坏情况），代价 KB 级 |
+| 5 | 池空时本轮已分配的页未回滚 | 长跑逐轮泄漏 | 失败分支 `_release_row_pages(keep=before)` |
+| 6 | GPU 测试 `sum(stats["proposed"])` | 对 int 调 `sum` → `TypeError` | 改 `stats["accepted"] <= stats["proposed"]` |
+| 7 | "峰值显存不升"断言口径错 | 单序列 dense 走 `DynamicCache`(1.6 MB) vs 页池 168 MB，靠 +0.2 GB 容差蒙过 | 该用例只做宽松回归；新增 **batch 模式** dense(`PaddedKVCache`) vs paged 的对照 |
+
+第 1、2、5 条都是**不报错但算错/泄漏**的类型，只能靠"同一输入两条路径逐位比对"和"页池计数不变量"发现——这也是为什么每条都补了 CPU 可复现的回归测试。
+
+### 未覆盖（诚实标注）
+
+- 引擎级 `n=128` 总长 158 < 页大小 256，**只覆盖单页**；跨页/多行只到 kernel 级；
+- **多行引擎路径（`max_num_seqs>1` + 页式）未跑**；
+- 路径二的 `spec_draft_paged_fa` 仍需在长上下文机型上验证才可考虑设默认。

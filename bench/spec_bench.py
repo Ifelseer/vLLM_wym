@@ -72,6 +72,7 @@ def _run_one(
     draft_paged: bool = False,
     draft_page_size: int = 16,
     draft_paged_pages: int = 0,
+    draft_paged_fa: bool = False,
     max_num_seqs: int = 1,
 ) -> dict:
     import torch
@@ -98,6 +99,7 @@ def _run_one(
             spec_draft_paged=draft_paged,
             spec_draft_page_size=draft_page_size,
             spec_draft_paged_pages=draft_paged_pages,
+            spec_draft_paged_fa=draft_paged_fa,
         )
     )
     try:
@@ -221,6 +223,12 @@ def main() -> None:
         default=0,
         help="页池容量（0=自动：max(64, max_rows×16)）；不足时该序列本步不起草",
     )
+    p.add_argument(
+        "--spec-draft-paged-fa",
+        action="store_true",
+        help="页式读路径二（flash_attn_with_kvcache + block_table）。"
+        "要求 --spec-draft-page-size 为 256 的倍数；需 GPU 实测",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--devices", default="0")
@@ -274,6 +282,7 @@ def main() -> None:
         draft_paged=args.spec_draft_paged,
         draft_page_size=args.spec_draft_page_size,
         draft_paged_pages=args.spec_draft_paged_pages,
+        draft_paged_fa=args.spec_draft_paged_fa,
         max_num_seqs=args.max_num_seqs,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")

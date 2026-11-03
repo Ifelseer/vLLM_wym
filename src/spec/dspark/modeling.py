@@ -146,7 +146,7 @@ class Qwen3DSparkAttention(nn.Module):
             k_cache, v_cache, seqlens, block_table = past_key_values.fa_args(
                 self.layer_idx
             )
-            attn_out = flash_attn_with_kvcache(
+            attn_output = flash_attn_with_kvcache(
                 q.transpose(1, 2),
                 k_cache,
                 v_cache,
@@ -154,10 +154,10 @@ class Qwen3DSparkAttention(nn.Module):
                 block_table=block_table,
                 causal=False,
             )
-            attn_out = attn_out.reshape(
-                bsz, q_len, self.num_attention_heads * self.head_dim
-            )
-            return attn_out, None
+            # 出口统一走 `_project_out`：这里曾经直接 reshape + return，
+            # 漏了 o_proj → 草稿 logits 全错、accept_len 从 4.27 掉到 1.11，
+            # 而输出 token 仍然正确（verify 不看草稿质量），属于静默失败。
+            return self._project_out(attn_output, None, bsz, q_len)
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -190,6 +190,22 @@ class Qwen3DSparkAttention(nn.Module):
             sliding_window=self.sliding_window,
             **kwargs,
         )
+        return self._project_out(attn_output, attn_weights, bsz, q_len)
+
+    def _project_out(
+        self,
+        attn_output: torch.Tensor,
+        attn_weights: torch.Tensor | None,
+        bsz: int,
+        q_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """attention 的**唯一出口**：reshape + ``o_proj``。
+
+        为什么抽成一个方法：读路径一（SDPA）与读路径二（FA paged）各自实现
+        attention，但收尾必须一致。之前 FA 分支自己 reshape + return，漏了
+        ``o_proj``，症状是草稿 logits 全错、``accept_len`` 从 4.27 掉到 1.11，
+        而输出 token 依旧正确（verify 不看草稿质量）—— 不报错、只掉收益。
+        """
         attn_output = attn_output.reshape(
             bsz, q_len, self.num_attention_heads * self.head_dim
         )
