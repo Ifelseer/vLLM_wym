@@ -186,8 +186,14 @@ class AsyncDecode:
             self._lookahead_streak = 0
             return False
 
-        # 提前一拍要覆盖到 num_cached + n（投机为 1+k，普通为 1）
-        n = 1 + max(0, self.core.config.spec_tokens)
+        # 在途那拍的**起点**由设备侧 advances 决定（1..1+k），CPU 只知道上界：
+        # 最晚从 num_cached + (1+k) 开始，再写 (1+k) 个位置。所以必须按 2*(1+k)
+        # 预留。只按 1+k 预留会在 KV 块边界上让 slot 落到未分配的块（表项 -1 →
+        # 负 slot），Triton kernel 直接非法访存——n=256/512 跨过第一个 256-token
+        # 块时实测 4/4 崩。
+        # 普通 decode 的 advances 恒为 1，同样需要 n=2 覆盖"下一拍写的位置"。
+        # 注意这是 may_append 的**瞬时预留**（相当于多看一个 block），不是永久膨胀。
+        n = 2 * (1 + max(0, self.core.config.spec_tokens))
         blocks = getattr(kv, "blocks", None)
         if blocks is not None and hasattr(blocks, "needed_append"):
             # **按总量判**：多行同时跨页时，逐行 `can_append` 各自都能过，

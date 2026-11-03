@@ -302,6 +302,52 @@ CUDA Graph 里、`build_decode` 只填 5 个字段 + 一次 H2D），所以 `C` 
 
 ---
 
+### 6.5 长上下文（n=512）暴露的两个问题
+
+n=128 一切正常，拉到 n=512（跨过第一个 256-token KV 块）才暴露：
+
+**① KV 预留少算了"下一拍的起点"——已修**
+
+```
+在途那拍起点 ≤ num_cached + (1+k)     ← 由设备侧 advances 决定
+再写 (1+k) 个位置
+⇒ 需要 num_cached + 2(1+k)
+```
+
+原来只按 `1+k` 预留，跨块那一步的 slot 落到未分配块（表项 `-1` → 负 slot），Triton
+kernel 直接 `illegal memory access`（修复前 n=256/512 **4/4 崩**）。修法是
+`n = 2 * (1 + spec_tokens)`（普通 decode 的 advances 恒为 1，同样需要 2）。这是
+`may_append` 的**瞬时预留**，等价于"多看一个 block"，不是永久膨胀。
+
+回归：`tests/unit/test_zos_kv_reserve.py`（k=7 → 16，k=0 → 2）。
+
+**② 投机 + ZOS 跨块后输出分叉——未解决**
+
+| 配置 | 输出 vs dense spec |
+|---|---|
+| dense spec n=512 | 基准（accept_len 4.571） |
+| ZOS spec n=512（verify 图） | **first diff = 262**（accept_len 3.957） |
+| ZOS spec n=512（eager） | **first diff = 262**，且与图版 token 彼此一致 |
+| plain ZOS n=512 | **与 sync 逐位一致** |
+
+已排除：verify 图/桶（eager 与 graph 相同）、KV 预留（已修，且修前是崩溃、修后是分叉）、
+块表未分配（修后不再有 `-1` slot，plain ZOS 同边界正常）。
+
+范围收窄到：**spec-ZOS 的 `advance_verify` 在块边界上的元数据**（positions / slot_mapping /
+cu_seqlens_k），与草稿、padded KV 无关（那些只影响草稿质量，不影响 verify 的 lossless 性）。
+
+建议的排查顺序（比直接对 logits 有效，因为页表是离散可逐值对照的）：
+
+1. 在跨边界那一拍 dump 三份：CPU 的 `seq.block_table`、设备 `block_tables[0,:k]`、
+   `advance_verify` 实际查出的 page。**只要设备表 ≠ CPU 表，就是刷新问题，直接定案**；
+2. 若相同，再比 `slot_mapping` 与同步路径 `slots_for_range` 在同一区间的值；
+3. 都相同，最后才比 target logits。
+
+**当前结论：长上下文不要开 `zos_spec`**（崩溃已修，但仍会分叉）。`--zos-spec` 默认关，
+配置护栏（`tests/unit/test_zos_spec_config.py`）只保证组合合法，不保证这个场景正确。
+
+---
+
 ## 7. 边界与未做
 
 | 项 | 状态 |
