@@ -209,6 +209,11 @@ class PagedDraftKV:
     def row_len(self, row: int) -> int:
         return self._lens_host[row]
 
+    @property
+    def active_rows(self) -> list[int]:
+        """本步**实际参与**的行（页池不足时会被剔除，调用方应据此退化为不起草）。"""
+        return list(self._rows)
+
     def get_seq_length(self) -> int:
         """供 ``Cache`` 协议使用（本步参与行的最大长度）。"""
         if not self._rows:
@@ -225,8 +230,13 @@ class PagedDraftKV:
         seg_rows: list[int] | None = None,
         seg_max: int = 0,
         block: int = 0,
+        device_segs: torch.Tensor | None = None,
     ) -> int:
-        """登记本步参与的行与各自的真实 ctx 长度，并预留 ``lens + seg + block`` 的页。
+        """登记本步参与的行与各自的真实 ctx 长度，并预留 ``lens + seg_max + block`` 的页。
+
+        ``device_segs``（ZOS 投机用）：页式下 seg 只影响掩码与退页，长度在设备上即可，
+        但**读路径一**仍需要 host 侧的 ``seg_max``。真正零同步要等读路径二（FA +
+        ``cache_seqlens``），所以这里显式拒绝而不是静默忽略。
 
         页不足时**不抛错**：把该行从本步移除（调用方视为「不起草」），保证长跑不会
         因为某个序列超长而整批失败。
@@ -234,6 +244,11 @@ class PagedDraftKV:
         Returns:
             本步 attention 需要的 ``kv_len``（= max(lens) + seg_max + block）。
         """
+        if device_segs is not None:
+            raise NotImplementedError(
+                "页式缓存暂不支持设备侧 seg（ZOS+投机需读路径二：FA + cache_seqlens）；"
+                "请关闭 zos_spec 或使用稠密路径"
+            )
         if rows is None:
             rows = self._rows
         if seg_rows is None:

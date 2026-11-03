@@ -57,6 +57,76 @@ def _ctx(seg: int) -> torch.Tensor:
     return torch.randn(1, seg, HIDDEN, generator=g)
 
 
+class TestPagedEquivalence:
+    """页式 KV 与稠密 KV 必须产出**逐位相同**的草稿 token。
+
+    两者只是"K/V 存在哪"不同（页池 + 页表 vs 每行预留满长度），数学完全一样。
+    任何差异都说明页表映射 / 写入偏移 / 退页边界写错了——而这类错误不会崩，
+    只会让接受率无声下滑。
+
+    注意：这是**同一实现家族内部**的比较（都走 SDPA），所以要求逐位；将来换成
+    FA paged 之后，跨实现的比较只能放宽到 accept_len 差值。
+    """
+
+    def _pair(self, model, *, seed: int = 0):
+        torch.manual_seed(seed)
+        dense = DSparkDrafter(model, device=torch.device("cpu"))
+        torch.manual_seed(seed)
+        paged = DSparkDrafter(
+            model,
+            device=torch.device("cpu"),
+            max_rows=4,
+            use_paged=True,
+            page_size=2,
+            num_pages=64,
+        )
+        return dense, paged
+
+    def test_single_sequence_two_steps(self, model):
+        seg = 3
+        ctx1 = _ctx(seg)
+        dense, paged = self._pair(model)
+
+        t_dense, _ = dense.propose(1, anchor_token_id=7, start=seg, first_ctx=ctx1)
+        t_paged, _ = paged.propose(1, anchor_token_id=7, start=seg, first_ctx=ctx1)
+        assert t_dense, "稠密路径不应返回空草稿"
+        assert t_paged == t_dense, f"paged={t_paged} dense={t_dense}"
+
+        # 第二步：各自追加 2 个 context（引擎侧由 update 推进 start）
+        ctx2 = _ctx(2)
+        start2 = seg + 2
+        dense.update(1, ctx2, start=start2)
+        paged.update(1, ctx2, start=start2)
+        d2, _ = dense.propose(1, anchor_token_id=9, start=start2, first_ctx=None)
+        p2, _ = paged.propose(1, anchor_token_id=9, start=start2, first_ctx=None)
+        assert d2, "第二步不应返回空草稿"
+        assert p2 == d2, f"第二步 paged={p2} dense={d2}"
+
+    def test_two_sequences_isolated(self, model):
+        """两条序列在页池里各占各的页，不能串位。"""
+        dense, paged = self._pair(model)
+        ctx_a, ctx_b = _ctx(3), _ctx(2)
+        da, _ = dense.propose(1, anchor_token_id=5, start=3, first_ctx=ctx_a)
+        db, _ = dense.propose(2, anchor_token_id=6, start=2, first_ctx=ctx_b)
+        pa, _ = paged.propose(1, anchor_token_id=5, start=3, first_ctx=ctx_a)
+        pb, _ = paged.propose(2, anchor_token_id=6, start=2, first_ctx=ctx_b)
+        assert pa == da and pb == db, f"paged=({pa},{pb}) dense=({da},{db})"
+
+    def test_pool_exhaustion_degrades_to_no_draft(self, model):
+        """页池不足时返回空草稿（只损收益），不能抛错或写错位置。"""
+        torch.manual_seed(0)
+        d = DSparkDrafter(
+            model,
+            device=torch.device("cpu"),
+            max_rows=2,
+            use_paged=True,
+            page_size=4,
+            num_pages=1,          # 只够 4 个 token
+        )
+        toks, _ = d.propose(1, anchor_token_id=7, start=32, first_ctx=_ctx(32))
+        assert toks == [], "页池不足应退化为不起草"
+
+
 class TestBatchEquivalence:
     def test_batch_matches_single(self, model):
         """两条序列（prompt 长度不同）分别起草，与批量起草结果逐位比对。"""

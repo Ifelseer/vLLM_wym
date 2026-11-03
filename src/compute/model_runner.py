@@ -658,6 +658,10 @@ class ModelRunner:
                 draft,
                 device=self.device,
                 max_rows=max(8, self.config.max_num_seqs * 4),
+                # 页式：容量 O(实际 token)；未开则沿用稠密（O(行数 × max_len)）
+                use_paged=bool(self.config.spec_draft_paged),
+                page_size=int(self.config.spec_draft_page_size),
+                num_pages=int(self.config.spec_draft_paged_pages),
             )
         return self._dspark
 

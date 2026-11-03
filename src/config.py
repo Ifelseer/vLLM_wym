@@ -122,6 +122,14 @@ class EngineConfig:
     # 逐序列串行时 b=4 的草稿占步时 61%，批量化后预期 b=4 加速比 1.70x -> ~3x。
     # 等价性已由 CPU 单测保证（批量与单跑 token 逐位相同）。
     spec_draft_batch: bool = False
+    # 草稿 KV 页式（P0-P2 已实现读路径一：gather 成稠密走现有 SDPA）。
+    # 收益是显存（O(实际 token) 取代 O(行数 × 上限)），不是速度；默认关以便对照。
+    spec_draft_paged: bool = False
+    #: 页大小。路径一可任意（16 足够细）；**路径二（FA paged）必须 256 的倍数**
+    #: （本仓 config 对 kvcache_block_size 有同样的硬校验）。
+    spec_draft_page_size: int = 16
+    #: 页池容量。0 表示按 `max(64, max_rows × 16)` 自动推导；不足时该序列本步不起草。
+    spec_draft_paged_pages: int = 0
 
     # --- ZOS（Zero-Overhead Scheduling）---
     # 让下一轮提交提前到上一轮结果处理之前：GPU 用自己上一轮的输出当输入，CPU 在后面

@@ -30,6 +30,7 @@ from transformers.cache_utils import DynamicCache
 
 from .modeling import Qwen3DSparkModel
 from .padded_cache import PaddedKVCache
+from .paged_cache import PagedDraftKV
 
 
 @dataclass
@@ -56,6 +57,9 @@ class DSparkDrafter:
         max_proposal: int = 0,
         max_ctx_len: int = 4096,
         max_rows: int = 8,
+        use_paged: bool = False,
+        page_size: int = 16,
+        num_pages: int = 0,
     ) -> None:
         self.model = model
         self.device = device
@@ -76,6 +80,11 @@ class DSparkDrafter:
         self._padded_seeded: set[int] = set()
         self.max_ctx_len = int(max_ctx_len)
         self.max_rows = int(max_rows)
+        #: 页式（读路径一）：容量 O(实际 token)，稠密是 O(行数 × max_len)
+        self.use_paged = bool(use_paged)
+        self.page_size = int(page_size)
+        self.num_pages = int(num_pages)
+        self._paged: PagedDraftKV | None = None
 
     # ---------------------------------------------------------------- #
     # 状态管理
@@ -131,6 +140,14 @@ class DSparkDrafter:
         Returns ``([], None)`` 的情形：账本漂移、缺 context、或 ``start`` 超界。
         调用方应退化为普通 decode，而不是报错。
         """
+        if self.use_paged:
+            return self._propose_paged(
+                seq_id,
+                anchor_token_id=anchor_token_id,
+                start=start,
+                first_ctx=first_ctx,
+            )
+
         st = self._state.get(seq_id)
         if st is None:
             if first_ctx is None or start <= 0:
@@ -206,6 +223,92 @@ class DSparkDrafter:
 
         return tokens[0].tolist(), (None if probs is None else probs[0])
 
+    @torch.inference_mode()
+    def _propose_paged(
+        self,
+        seq_id: int,
+        *,
+        anchor_token_id: int,
+        start: int,
+        first_ctx: torch.Tensor | None = None,
+    ) -> tuple[list[int], torch.Tensor | None]:
+        """单序列起草的页式版本（``use_paged=True`` 时走这里）。
+
+        与稠密版的差别只在 KV 容器：长度取 `cache.row_len(row)`（页表维护），
+        其余（位置区间 `[cached, start+block)`、只留 context 的 crop）完全一致。
+        """
+        cache = self._ensure_paged()
+        row = self._row(seq_id)
+        cached = cache.row_len(row)
+
+        st = self._state.get(seq_id)
+        if st is None:
+            if first_ctx is None or start <= 0:
+                return [], None
+            st = _DraftState(past=DynamicCache(), pending_ctx=first_ctx, start=start)
+            self._state[seq_id] = st
+        elif st.start != start:
+            # 账本漂移：丢弃状态与本行的页，本步不起草
+            self._state.pop(seq_id, None)
+            cache.reset_row(row)
+            return [], None
+
+        if st.pending_ctx is None:
+            return [], None
+        ctx = st.pending_ctx
+        if ctx.dim() == 2:
+            ctx = ctx.unsqueeze(0)
+        seg = int(ctx.shape[-2])
+        if cached + seg != start:
+            self.reset_seq(seq_id)
+            return [], None
+
+        block = self.block_size
+        ids = torch.full(
+            (1, block), self.mask_token_id, dtype=torch.long, device=self.device
+        )
+        ids[0, 0] = int(anchor_token_id)
+        positions = torch.arange(
+            cached, start + block, dtype=torch.long, device=self.device
+        ).unsqueeze(0)
+
+        cache.begin_step([row], [seg], seg_max=seg, block=block)
+        if len(cache.active_rows) != 1:
+            # 页池不足：本步不起草（只损收益，不影响正确性）
+            return [], None
+        mask = cache.mask(q_len=block)
+        hidden = self.model._forward_backbone(
+            position_ids=positions,
+            noise_embedding=self.model.embed_tokens(ids),
+            target_hidden_states=ctx,
+            attention_mask=mask,
+            past_key_values=cache,
+            use_cache=True,
+            is_causal=False,
+        )
+        cache.crop()
+        st.pending_ctx = None
+
+        block_hidden = hidden[:, :block, :]
+        base_logits = self.model.compute_logits(block_hidden)
+        tokens, corrected = self.model.sample_draft_tokens(
+            base_logits,
+            first_prev_token_ids=torch.tensor(
+                [int(anchor_token_id)], dtype=torch.long, device=self.device
+            ),
+            temperature=self.temperature,
+            hidden_states=block_hidden,
+        )
+        probs = None
+        if self.temperature > 1e-5:
+            probs = torch.softmax(corrected.float() / self.temperature, dim=-1)
+        keep = self.max_proposal
+        if keep < block:
+            tokens = tokens[:, :keep]
+            if probs is not None:
+                probs = probs[:, :keep]
+        return tokens[0].tolist(), (None if probs is None else probs[0])
+
     # ---------------------------------------------------------------- #
     # 批量起草（B 条序列一次前向，权重只读一遍）
     # ---------------------------------------------------------------- #
@@ -226,6 +329,35 @@ class DSparkDrafter:
         row = free[0]
         self._row_of[seq_id] = row
         return row
+
+    def _ensure_paged(self) -> PagedDraftKV:
+        """页池容量：`num_pages=0` 时按 `max(64, max_rows × 16)` 推导。
+
+        这个推导值决定了「总共能装多少 token」= `num_pages × page_size`；
+        默认 16 页/行 × 16 token/页 = 每行 256 token 的预算，超出时该序列本步不起草。
+        显存约为 `num_pages × page_size × heads × dim × 2 × layers × 2B`。
+        """
+        if self._paged is None:
+            cfg = self.model.config
+            pages = self.num_pages or max(64, self.max_rows * 16)
+            self._paged = PagedDraftKV(
+                num_layers=int(cfg.num_hidden_layers),
+                num_kv_heads=int(cfg.num_key_value_heads),
+                head_dim=int(
+                    getattr(cfg, "head_dim", None)
+                    or cfg.hidden_size // cfg.num_attention_heads
+                ),
+                num_rows=max(1, self.max_rows),
+                num_pages=int(pages),
+                page_size=self.page_size,
+                device=self.device,
+                dtype=next(self.model.parameters()).dtype,
+            )
+        return self._paged
+
+    def _ensure_cache(self):
+        """当前生效的草稿 KV（页式或稠密）。两者接口同签名，调用点无需分支。"""
+        return self._ensure_paged() if self.use_paged else self._ensure_padded()
 
     def _ensure_padded(self) -> PaddedKVCache:
         if self._padded is None:
@@ -372,15 +504,19 @@ class DSparkDrafter:
         if st is None:
             return
         row = self._row(seq_id)
-        if self._ensure_padded().seed_from_dynamic(row, st.past) > 0:
+        if self._ensure_cache().seed_from_dynamic(row, st.past) > 0:
             self._padded_seeded.add(seq_id)
 
     def reset_seq(self, seq_id: int) -> None:
         """释放一条序列的草稿状态与 KV 行。"""
         self.reset(seq_id)
         row = self._row_of.pop(seq_id, None)
-        if row is not None and self._padded is not None:
-            self._padded.reset_row(row)
+        if row is not None:
+            # 两种容器都可能在生命周期内被创建过，都要回收
+            if self._padded is not None:
+                self._padded.reset_row(row)
+            if self._paged is not None:
+                self._paged.reset_row(row)
 
     @torch.inference_mode()
     def propose_batch(
@@ -426,7 +562,7 @@ class DSparkDrafter:
             return out
 
         # 2) 组批：ctx pad 到 seg_max，位置按各自 start 排
-        cache = self._ensure_padded()
+        cache = self._ensure_cache()
         rows = [self._row(items[i][0]) for i in parts]
         seg_max = max(segs)
         block = self.block_size
@@ -469,6 +605,13 @@ class DSparkDrafter:
                 cache.seed_row(r, want)
 
         kv_len = cache.begin_step(rows, segs, seg_max, block)
+        if self.use_paged and len(cache.active_rows) < len(rows):
+            # 页池不足时 begin_step 会剔除部分行；行号一旦错位就会串数据，
+            # 所以整批退回逐序列（每条各自降级为"不起草"）。
+            return [
+                self.propose(sid, anchor_token_id=a, start=st, first_ctx=fc)
+                for sid, a, st, fc in items
+            ]
         # q 只有 block 个（块内非因果），kv 才是 seg_max+block —— 掩码按 q 长度给
         mask = cache.mask(q_len=block)
         hidden = self.model._forward_backbone(

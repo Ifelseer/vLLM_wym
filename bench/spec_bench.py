@@ -69,6 +69,9 @@ def _run_one(
     num_blocks: int = 64,
     verify_graph: bool = False,
     draft_batch: bool = False,
+    draft_paged: bool = False,
+    draft_page_size: int = 16,
+    draft_paged_pages: int = 0,
     max_num_seqs: int = 1,
 ) -> dict:
     import torch
@@ -92,6 +95,9 @@ def _run_one(
             spec_draft_model=draft_model,
             spec_verify_graph=verify_graph,
             spec_draft_batch=draft_batch,
+            spec_draft_paged=draft_paged,
+            spec_draft_page_size=draft_page_size,
+            spec_draft_paged_pages=draft_paged_pages,
         )
     )
     try:
@@ -198,6 +204,23 @@ def main() -> None:
         action="store_true",
         help="草稿批量化：B 条序列一次前向（等价性见 test_dspark_drafter_batch）",
     )
+    p.add_argument(
+        "--spec-draft-paged",
+        action="store_true",
+        help="草稿 KV 页式存储（省显存；等价性见 TestPagedEquivalence）",
+    )
+    p.add_argument(
+        "--spec-draft-page-size",
+        type=int,
+        default=16,
+        help="页式草稿 KV 的页大小（路径一可任意；将来开 FA paged 时必须 256 的倍数）",
+    )
+    p.add_argument(
+        "--spec-draft-paged-pages",
+        type=int,
+        default=0,
+        help="页池容量（0=自动：max(64, max_rows×16)）；不足时该序列本步不起草",
+    )
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--devices", default="0")
@@ -248,6 +271,9 @@ def main() -> None:
         num_blocks=args.num_kvcache_blocks,
         verify_graph=args.spec_verify_graph,
         draft_batch=args.spec_draft_batch,
+        draft_paged=args.spec_draft_paged,
+        draft_page_size=args.spec_draft_page_size,
+        draft_paged_pages=args.spec_draft_paged_pages,
         max_num_seqs=args.max_num_seqs,
     )
     print(f"[run] baseline spec=0 model={args.model} quant={args.quantization}")
